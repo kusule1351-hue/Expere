@@ -15,7 +15,9 @@ Press **Alt+Space**, type, press **Enter**.
 | `expere settings` | The settings window |
 | Anything | Web search fallback as the last row |
 
-Keys: `↑` `↓` / `Tab` move, `Enter` open, `Ctrl+Enter` show in folder, `Esc` clear then close, `Ctrl+,` settings.
+Keys: `↑` `↓` / `Tab` move, `PgUp` `PgDn` jump a page, `Enter` open, `Ctrl+Enter` show in folder, `Esc` clear then
+close, `Ctrl+,` settings. When there are more results than rows, scroll with the wheel or touchpad, or drag the
+scroll bar on the right; the web search is always the last item.
 The search box supports the usual editing keys: `Ctrl+←/→`, `Shift`-selection, `Ctrl+A/C/X/V`, `Ctrl+Backspace`.
 Things you open often rank higher (counts are kept in `%APPDATA%\Expere\history.txt`).
 
@@ -31,7 +33,7 @@ Open with `Ctrl+,`, the tray menu, or by typing `expere settings`. Saved to `%AP
 | Theme | Follow Windows, Dark, Light |
 | Background | **Acrylic** (blurred, like the Start menu), **Transparent** (clear tinted glass), **Solid** |
 | Opacity | 20–100 %: how strong the tint is over the blur or glass |
-| Results shown | 3–10 rows |
+| Visible rows | 3–10 rows on screen; up to 61 results scroll |
 | Web search | Google, Bing, DuckDuckGo, Brave Search |
 | Include files and folders | Turn file search off to keep results to apps and commands |
 | Start with Windows | Adds/removes Expere from `HKCU\…\Run` |

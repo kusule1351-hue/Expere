@@ -62,7 +62,9 @@
 #define SEARCH_DELAY_MS  90
 #define TRIM_AGAIN_MS    20000  // shell and COM threads touch pages for a while after we hide
 #define WS_MAX           24
-#define MAX_ROWS         10
+#define MAX_ROWS         10                 // most rows visible at once; the rest scroll
+#define MAX_CAND         30                 // results kept per source (apps+commands+folders, files)
+#define MAX_SHOWN        (2 * MAX_CAND + 1) // plus the web search row
 #define APP_REFRESH_MS   (10 * 60 * 1000)
 
 // WM_COPYDATA tags. Everything replies carry EV_REPLY_BASE | query sequence.
@@ -225,10 +227,12 @@ static WCHAR g_wsQuery[512];
 static DWORD g_wsSeq;
 static BOOL g_wsPending, g_wsRelease;
 
-static Result g_local[MAX_ROWS], g_files[MAX_ROWS], g_extra;
+static Result *g_local, *g_files, g_extra;  // MAX_CAND each, allocated only while the window is shown
 static int g_nlocal, g_nfiles;
-static Result *g_shown[MAX_ROWS];
-static int g_nshown, g_sel;
+static Result *g_shown[MAX_SHOWN];
+static int g_nshown, g_sel, g_top;  // g_top: first visible row
+static int g_wheelAcc, g_sbGrab;    // wheel remainder; where the scroll thumb was grabbed
+static BOOL g_sbDragging, g_sbHover, g_mouseTracked;
 
 static Hist g_hist[256];
 static int g_nhist;
@@ -658,6 +662,7 @@ static void StartAppIndex(void) {
 // Keeps `a` sorted by score, capped at `cap`. Returns the slot to fill, or NULL if it does not rank.
 static Result *Slot(Result *a, int *n, int cap, int score) {
     int i = *n;
+    if (!a) return NULL;  // window hidden: result lists are not allocated
     if (i == cap) {
         if (score <= a[cap - 1].score) return NULL;
         i = cap - 1;
@@ -873,21 +878,73 @@ static BOOL QueryEverything(const WCHAR *q) {
 
 // ---------------------------------------------------------------- query -> results
 
+// ---------------------------------------------------------------- scrolling
+
+static int VisRows(void) { return Min(g_nshown, g_set.maxResults); }
+
+static void ClampTop(void) { g_top = Max(0, Min(g_top, g_nshown - VisRows())); }
+
+static void EnsureSelVisible(void) {
+    if (g_sel < g_top) g_top = g_sel;
+    else if (g_sel >= g_top + VisRows()) g_top = g_sel - VisRows() + 1;
+    ClampTop();
+}
+
+static void ScrollBy(int rows) {
+    int old = g_top;
+    g_top += rows;
+    ClampTop();
+    if (g_top != old) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// Scroll bar geometry, in client coordinates: the track spans the visible rows.
+static void ScrollTrack(int *top, int *bottom) {
+    *top = S(EDIT_H) + S(1) + S(PAD);
+    *bottom = *top + VisRows() * S(ROW_H);
+}
+
+static void ScrollThumb(int *top, int *bottom) {
+    int tt, tb;
+    ScrollTrack(&tt, &tb);
+    int len = tb - tt, th = Max(S(28), len * VisRows() / Max(1, g_nshown)), range = g_nshown - VisRows();
+    *top = tt + (range > 0 ? (len - th) * g_top / range : 0);
+    *bottom = *top + th;
+}
+
+static BOOL InScrollbar(int x, int y) {
+    if (g_nshown <= VisRows()) return FALSE;
+    int tt, tb;
+    ScrollTrack(&tt, &tb);
+    return x >= S(WIN_W) - S(PAD) - S(4) && y >= tt && y < tb;
+}
+
+static void DragThumbTo(int y) {
+    int tt, tb, th0, th1;
+    ScrollTrack(&tt, &tb);
+    ScrollThumb(&th0, &th1);
+    int free = (tb - tt) - (th1 - th0), range = g_nshown - VisRows();
+    int top = free > 0 ? ((y - g_sbGrab - tt) * range + free / 2) / free : 0;
+    ScrollBy(top - g_top);
+}
+
+// ---------------------------------------------------------------- query -> results
+
 static void Merge(void) {
-    int a = 0, b = 0, n = 0, cap = g_query[0] ? g_set.maxResults - 1 : 0;
+    int a = 0, b = 0, n = 0, cap = g_query[0] ? MAX_SHOWN - 1 : 0;
     while (n < cap && (a < g_nlocal || b < g_nfiles)) {
         if (b >= g_nfiles || (a < g_nlocal && g_local[a].score >= g_files[b].score)) g_shown[n++] = &g_local[a++];
         else g_shown[n++] = &g_files[b++];
     }
-    if (g_query[0]) g_shown[n++] = &g_extra;
+    if (g_query[0]) g_shown[n++] = &g_extra;  // the web search is always the last row
     g_nshown = n;
     if (g_sel >= n) g_sel = n - 1;
     if (g_sel < 0) g_sel = 0;
+    ClampTop();
 }
 
 static void Relayout(void) {
     int w = S(WIN_W), h = S(EDIT_H);
-    if (g_nshown) h += S(1) + S(PAD) * 2 + g_nshown * S(ROW_H) + S(FOOT_H);
+    if (g_nshown) h += S(1) + S(PAD) * 2 + VisRows() * S(ROW_H) + S(FOOT_H);
     int x = g_work.left + ((g_work.right - g_work.left) - w) / 2;
     int y = g_work.top + (g_work.bottom - g_work.top) / 5;
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
@@ -902,15 +959,15 @@ static void OnQueryChanged(void) {
 
     g_seq++;
     g_nlocal = g_nfiles = 0;
-    g_sel = 0;
+    g_sel = g_top = 0;
     g_fileSource = FS_NONE;
     KillTimer(g_hwnd, TIMER_SEARCH);
 
     if (g_query[0]) {
         double v;
         BOOL calc = TryCalc(g_query, &v);
-        if (calc) {
-            Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, 1 << 20);
+        Result *r;
+        if (calc && (r = Slot(g_local, &g_nlocal, MAX_CAND, 1 << 20))) {
             r->kind = K_CALC;
             FormatNum(v, r->target, 64);
             _snwprintf(r->title, 160, L"= %ls", r->target);
@@ -922,7 +979,7 @@ static void OnQueryChanged(void) {
                 int s = Fuzzy(a->name, g_query);
                 if (s < 0) continue;
                 s += 30 + HistBonus(HistCount(L"shell:AppsFolder\\", a->parse));  // apps edge out files of equal quality
-                Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, s);
+                Result *r = Slot(g_local, &g_nlocal, MAX_CAND, s);
                 if (!r) continue;
                 r->kind = K_APP;
                 lstrcpynW(r->title, a->name, 160);
@@ -933,7 +990,7 @@ static void OnQueryChanged(void) {
         for (int i = 0; i < (int)ARRAYSIZE(CMDS); i++) {
             int s = Fuzzy(CMDS[i].name, g_query);
             if (s < 0) continue;
-            Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, s + 30);
+            Result *r = Slot(g_local, &g_nlocal, MAX_CAND, s + 30);
             if (!r) continue;
             r->kind = K_CMD;
             r->cmd = i;
@@ -947,7 +1004,7 @@ static void OnQueryChanged(void) {
                 if (s < 0) continue;
                 WCHAR full[1100];
                 DirPath(g_apps, i, full, 1100);
-                Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, s - 10 + PathBonus(full) + HistBonus(HistCount(L"", full)));
+                Result *r = Slot(g_local, &g_nlocal, MAX_CAND, s - 10 + PathBonus(full) + HistBonus(HistCount(L"", full)));
                 if (!r) continue;
                 r->kind = K_FOLDER;
                 lstrcpynW(r->title, d->name, 160);
@@ -982,7 +1039,7 @@ static void AddFile(const WCHAR *name, const WCHAR *dir, const WCHAR *full, BOOL
     int s = Fuzzy(name, g_query);
     if (s < 0) s = 0;
     s += HistBonus(HistCount(L"", full)) + PathBonus(full) - 10;
-    Result *r = Slot(g_files, &g_nfiles, MAX_ROWS, s);
+    Result *r = Slot(g_files, &g_nfiles, MAX_CAND, s);
     if (!r) return;
     r->kind = folder ? K_FOLDER : K_FILE;
     lstrcpynW(r->title, name, 160);
@@ -992,7 +1049,7 @@ static void AddFile(const WCHAR *name, const WCHAR *dir, const WCHAR *full, BOOL
 
 // Used only when no file index answers: hand the query to Explorer.
 static void AddExplorerSearch(void) {
-    Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, -200);
+    Result *r = Slot(g_local, &g_nlocal, MAX_CAND, -200);
     if (!r) return;
     WCHAR enc[1000];
     r->kind = K_SEARCH;
@@ -1511,9 +1568,18 @@ static void DrawScene(int w, int h) {
     if (!g_nshown) return;
     int line = Max(1, S(1)), top0 = S(EDIT_H) + S(1) + S(PAD);
     FillRound(0, S(EDIT_H), w, S(EDIT_H) + line, 0, g_pal.line, g_pal.lineA);
-    for (int i = 0; i < g_nshown; i++) {
+    for (int i = 0; i < VisRows(); i++) {
         int top = top0 + i * S(ROW_H);
-        if (top < g_bandY + g_bandH && top + S(ROW_H) > g_bandY) DrawRow(g_shown[i], i == g_sel, top, w);
+        if (top < g_bandY + g_bandH && top + S(ROW_H) > g_bandY) DrawRow(g_shown[g_top + i], g_top + i == g_sel, top, w);
+    }
+    if (g_nshown > VisRows()) {  // overlay scroll bar: a thin thumb that widens on hover, like Windows 11
+        int tt, tb, t0, t1;
+        BOOL wide = g_sbHover || g_sbDragging;
+        int bw = wide ? S(6) : Max(2, S(3)), right = w - S(3);
+        ScrollTrack(&tt, &tb);
+        ScrollThumb(&t0, &t1);
+        if (wide) FillRound(right - bw, tt, right, tb, bw / 2, g_pal.text, 20);
+        FillRound(right - bw, t0, right, t1, bw / 2, g_pal.text, wide ? 150 : 90);
     }
     int fy = h - S(FOOT_H);
     if (fy >= g_bandY + g_bandH || h <= g_bandY) return;
@@ -1535,7 +1601,7 @@ static void PaintWindow(HDC hdc, const RECT *dirty) {
     ys[nb++] = 0;
     if (g_nshown) {
         int top0 = S(EDIT_H) + S(1) + S(PAD);
-        for (int i = 0; i <= g_nshown; i++) ys[nb++] = Min(top0 + i * S(ROW_H), h);
+        for (int i = 0; i <= VisRows(); i++) ys[nb++] = Min(top0 + i * S(ROW_H), h);
     }
     if (ys[nb - 1] < h) ys[nb++] = h;
     int maxH = 0;
@@ -1553,11 +1619,12 @@ static void PaintWindow(HDC hdc, const RECT *dirty) {
     }
 }
 
+// Index into g_shown of the row under client y, or -1.
 static int RowAt(int y) {
     int top0 = S(EDIT_H) + S(1) + S(PAD);
     if (y < top0) return -1;
     int i = (y - top0) / S(ROW_H);
-    return i < g_nshown ? i : -1;
+    return i < VisRows() ? g_top + i : -1;
 }
 
 static HFONT MakeFont(int px, int weight, const WCHAR *face) {
@@ -1604,6 +1671,10 @@ static void HideLauncher(void) {
     KillTimer(g_hwnd, TIMER_CARET);
     WsRequest(NULL, 0, TRUE);  // the worker drops its Windows Search connection
     FreeBuffers();
+    g_nlocal = g_nfiles = g_nshown = 0;  // ~200 KB of result lists, only needed while shown
+    HeapFree(GetProcessHeap(), 0, g_local);
+    HeapFree(GetProcessHeap(), 0, g_files);
+    g_local = g_files = NULL;
     Trim();
     SetTimer(g_hwnd, TIMER_TRIM, TRIM_AGAIN_MS, NULL);
 }
@@ -1632,6 +1703,8 @@ static void ShowLauncher(const WCHAR *text) {
     }
     g_scroll = 0;
     EnsureCaretVisible();
+    if (!g_local) g_local = HeapAlloc(GetProcessHeap(), 0, MAX_CAND * sizeof(Result));
+    if (!g_files) g_files = HeapAlloc(GetProcessHeap(), 0, MAX_CAND * sizeof(Result));
     OnQueryChanged();
 
     ShowWindow(g_hwnd, SW_SHOW);
@@ -1718,9 +1791,14 @@ static BOOL OnKey(WPARAM vk) {
     case VK_DOWN:
     case VK_UP:
     case VK_TAB:
+    case VK_PRIOR:
+    case VK_NEXT:
         if (!g_nshown) return TRUE;
-        if (vk == VK_UP || (vk == VK_TAB && shift)) g_sel = (g_sel + g_nshown - 1) % g_nshown;
+        if (vk == VK_PRIOR) g_sel = Max(0, g_sel - VisRows());
+        else if (vk == VK_NEXT) g_sel = Min(g_nshown - 1, g_sel + VisRows());
+        else if (vk == VK_UP || (vk == VK_TAB && shift)) g_sel = (g_sel + g_nshown - 1) % g_nshown;
         else g_sel = (g_sel + 1) % g_nshown;
+        EnsureSelVisible();
         InvalidateRect(g_hwnd, NULL, FALSE);
         return TRUE;
     case VK_RETURN:
@@ -2127,22 +2205,57 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (g_dragging) {
-            g_caret = HitChar(GET_X_LPARAM(lp));
+            g_caret = HitChar(x);
             CaretMoved();
             return 0;
         }
+        if (g_sbDragging) {
+            DragThumbTo(y);
+            return 0;
+        }
+        if (!g_mouseTracked) {  // ask for WM_MOUSELEAVE so the scroll bar can narrow again
+            TRACKMOUSEEVENT tme = {sizeof tme, TME_LEAVE, hwnd, 0};
+            g_mouseTracked = TrackMouseEvent(&tme);
+        }
+        BOOL hover = InScrollbar(x, y);
+        if (hover != g_sbHover) { g_sbHover = hover; InvalidateRect(hwnd, NULL, FALSE); }
         POINT pt;
         GetCursorPos(&pt);
-        if (pt.x == g_lastMouse.x && pt.y == g_lastMouse.y) return 0;
+        if (hover || (pt.x == g_lastMouse.x && pt.y == g_lastMouse.y)) return 0;
         g_lastMouse = pt;
-        int i = RowAt(GET_Y_LPARAM(lp));
+        int i = RowAt(y);
         if (i >= 0 && i != g_sel) { g_sel = i; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_mouseTracked = FALSE;
+        if (g_sbHover && !g_sbDragging) { g_sbHover = FALSE; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        // One row per notch; touchpads send smaller deltas, which add up.
+        g_wheelAcc += GET_WHEEL_DELTA_WPARAM(wp);
+        int rows = g_wheelAcc / WHEEL_DELTA;
+        if (rows) { g_wheelAcc -= rows * WHEEL_DELTA; ScrollBy(-rows); }
         return 0;
     }
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         int y = GET_Y_LPARAM(lp);
+        if (InScrollbar(GET_X_LPARAM(lp), y)) {
+            int t0, t1;
+            ScrollThumb(&t0, &t1);
+            if (y >= t0 && y < t1) {  // grab the thumb
+                g_sbGrab = y - t0;
+                g_sbDragging = TRUE;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else {  // click on the track pages towards it
+                ScrollBy(y < t0 ? -VisRows() : VisRows());
+            }
+            return 0;
+        }
         if (y < S(EDIT_H)) {
             if (msg == WM_LBUTTONDBLCLK) {
                 g_anchor = 0;
@@ -2161,10 +2274,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP:
-        if (g_dragging) ReleaseCapture();
+        if (g_dragging || g_sbDragging) ReleaseCapture();
         return 0;
     case WM_CAPTURECHANGED:
-        g_dragging = FALSE;
+        if (g_sbDragging) InvalidateRect(hwnd, NULL, FALSE);
+        g_dragging = g_sbDragging = FALSE;
         return 0;
     case WM_NCCALCSIZE:
         if (wp) return 0;  // the client area covers the whole window: no visible frame
