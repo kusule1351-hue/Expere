@@ -148,7 +148,16 @@ static const Palette PAL_LIGHT = {RGB(22, 22, 26), RGB(90, 90, 102), RGB(56, 90,
 // ---------------------------------------------------------------- types
 
 typedef struct { WCHAR *name, *parse; } App;
-typedef struct { HANDLE heap; App *items; int n, cap; } AppIndex;
+typedef struct { WCHAR *name; int parent; } Dir;  // folder tree: full paths are rebuilt only for shown results
+typedef struct {
+    HANDLE heap;
+    App *items;
+    int n, cap;
+    Dir *dirs;
+    int nd, capd;
+    WCHAR *arena;  // strings are bump-allocated in chunks; HeapDestroy frees everything at once
+    size_t arenaLeft;
+} AppIndex;
 
 typedef struct {
     int kind, score, icon, cmd;  // icon: -2 = not resolved yet, -1 = none
@@ -187,7 +196,8 @@ static RECT g_work;
 static NOTIFYICONDATAW g_nid;
 static UINT g_wmTaskbarCreated;
 static POINT g_lastMouse;
-static BOOL g_activated, g_hotkeyOk, g_acrylic, g_dragging;
+static BOOL g_activated, g_hotkeyOk, g_dragging;
+static enum { BLUR_NONE, BLUR_SYSTEM, BLUR_ACCENT } g_blur;  // who draws the blurred background
 static Palette g_pal;
 
 // Strip renderer: g_band holds rows [g_bandY, g_bandY + g_bandH) of the window.
@@ -252,8 +262,8 @@ static int Fuzzy(const WCHAR *s, const WCHAR *q0) {
     int len = (int)wcslen(s);
     const WCHAR *sub = StrStrIW(s, q0);
     if (sub) {
-        int at = (int)(sub - s);
-        return 60 + (at == 0 ? 40 : IsWordStart(s, at) ? 20 : 0) - at / 2 - len / 10;
+        int at = (int)(sub - s), exact = at == 0 && (int)wcslen(q0) == len ? 60 : 0;
+        return 60 + exact + (at == 0 ? 40 : IsWordStart(s, at) ? 20 : 0) - at / 2 - len / 10;
     }
     int score = 0, si = 0, last = -1;
     BOOL acronym = TRUE;
@@ -384,7 +394,25 @@ static void FormatNum(double v, WCHAR *out, int cap) {
 
 // ---------------------------------------------------------------- files on disk: settings + history
 
+// Files and folders: shallow paths and paths in the user's own folder are usually the ones meant.
+static WCHAR g_profile[MAX_PATH];
+static int g_profileLen;
+
+static int PathBonus(const WCHAR *full) {
+    int depth = 0;
+    for (const WCHAR *p = full; *p; p++) depth += *p == L'\\';
+    int b = -3 * depth;
+    if (g_profileLen && !_wcsnicmp(full, g_profile, g_profileLen) && full[g_profileLen] == L'\\') b += 8;
+    return b;
+}
+
 static void InitPaths(void) {
+    PWSTR profile;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &profile))) {
+        lstrcpynW(g_profile, profile, MAX_PATH);
+        g_profileLen = (int)wcslen(g_profile);
+        CoTaskMemFree(profile);
+    }
     PWSTR roaming;
     if (FAILED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, NULL, &roaming))) return;
     _snwprintf(g_dataDir, MAX_PATH, L"%ls\\Expere", roaming);
@@ -491,11 +519,86 @@ static void ClearHistory(void) {
 
 // ---------------------------------------------------------------- app index (background thread)
 
-static WCHAR *HeapDup(HANDLE heap, const WCHAR *s) {
-    size_t n = (wcslen(s) + 1) * sizeof(WCHAR);
-    WCHAR *d = HeapAlloc(heap, 0, n);
-    if (d) memcpy(d, s, n);
+static WCHAR *IxDup(AppIndex *ix, const WCHAR *s) {
+    size_t n = wcslen(s) + 1;
+    if (n > ix->arenaLeft) {
+        size_t chunk = n > 8192 ? n : 8192;
+        ix->arena = HeapAlloc(ix->heap, 0, chunk * sizeof(WCHAR));
+        ix->arenaLeft = ix->arena ? chunk : 0;
+        if (!ix->arena) return NULL;
+    }
+    WCHAR *d = ix->arena;
+    memcpy(d, s, n * sizeof(WCHAR));
+    ix->arena += n;
+    ix->arenaLeft -= n;
     return d;
+}
+
+// Folders Windows Search does not index. Users is skipped because the index already covers it.
+#define DIR_DEPTH 5
+#define DIR_MAX   20000
+static const WCHAR *DIR_SKIP_ROOT[] = {L"Users", L"Windows", L"Program Files", L"Program Files (x86)", L"ProgramData",
+                                       L"PerfLogs", L"Recovery", L"System Volume Information", L"OneDriveTemp"};
+
+static int AddDir(AppIndex *ix, const WCHAR *name, int parent) {
+    if (ix->nd == ix->capd) {
+        int cap = ix->capd ? ix->capd * 2 : 512;
+        Dir *grown = ix->dirs ? HeapReAlloc(ix->heap, 0, ix->dirs, cap * sizeof(Dir)) : HeapAlloc(ix->heap, 0, cap * sizeof(Dir));
+        if (!grown) return -1;
+        ix->dirs = grown;
+        ix->capd = cap;
+    }
+    if (!(ix->dirs[ix->nd].name = IxDup(ix, name))) return -1;
+    ix->dirs[ix->nd].parent = parent;
+    return ix->nd++;
+}
+
+// path holds `len` characters on entry and is restored before returning.
+static void ScanDirs(AppIndex *ix, WCHAR *path, size_t len, int parent, int depth) {
+    if (depth > DIR_DEPTH || ix->nd >= DIR_MAX || len + 3 >= 1024) return;
+    wcscpy(path + len, L"\\*");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(path, FindExInfoBasic, &fd, FindExSearchLimitToDirectories, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    path[len] = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const WCHAR *n = fd.cFileName;
+        DWORD skipAttr = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & skipAttr)) continue;
+        if (n[0] == L'.' || n[0] == L'$' || !_wcsicmp(n, L"node_modules")) continue;  // also "." and ".."
+        BOOL skip = FALSE;
+        for (int i = 0; depth == 1 && i < (int)ARRAYSIZE(DIR_SKIP_ROOT) && !skip; i++) skip = !_wcsicmp(n, DIR_SKIP_ROOT[i]);
+        size_t nl = wcslen(n);
+        if (skip || len + 1 + nl + 3 >= 1024) continue;
+        int me = AddDir(ix, n, parent);
+        if (me < 0) break;
+        path[len] = L'\\';
+        wcscpy(path + len + 1, n);
+        ScanDirs(ix, path, len + 1 + nl, me, depth + 1);
+        path[len] = 0;
+    } while (ix->nd < DIR_MAX && FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void ScanFixedDrives(AppIndex *ix) {
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        WCHAR root[4] = {(WCHAR)(L'A' + i), L':', L'\\', 0}, path[1024] = {(WCHAR)(L'A' + i), L':', 0};
+        if (!(drives & (1u << i)) || GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        int me = AddDir(ix, path, -1);  // drive roots ("C:") are not search results
+        if (me < 0) return;
+        ScanDirs(ix, path, 2, me, 1);
+    }
+}
+
+// Rebuilds "C:\Expere\src" from the folder tree.
+static void DirPath(const AppIndex *ix, int i, WCHAR *out, int cap) {
+    int chain[DIR_DEPTH + 2], n = 0;
+    for (; i >= 0 && n < DIR_DEPTH + 2; i = ix->dirs[i].parent) chain[n++] = i;
+    int o = 0;
+    out[0] = 0;
+    while (n-- > 0 && o < cap - 1) o += _snwprintf(out + o, cap - o, o ? L"\\%ls" : L"%ls", ix->dirs[chain[n]].name);
+    out[cap - 1] = 0;
 }
 
 static DWORD WINAPI AppIndexThread(LPVOID unused) {
@@ -521,8 +624,8 @@ static DWORD WINAPI AppIndexThread(LPVOID unused) {
                             if (grown) { ix->items = grown; ix->cap = cap; }
                         }
                         if (ix->n < ix->cap) {
-                            ix->items[ix->n].name = HeapDup(heap, name);
-                            ix->items[ix->n].parse = HeapDup(heap, parse);
+                            ix->items[ix->n].name = IxDup(ix, name);
+                            ix->items[ix->n].parse = IxDup(ix, parse);
                             if (ix->items[ix->n].name && ix->items[ix->n].parse) ix->n++;
                         }
                     }
@@ -534,6 +637,7 @@ static DWORD WINAPI AppIndexThread(LPVOID unused) {
             }
             IShellItem_Release(folder);
         }
+        ScanFixedDrives(ix);
     }
     if (!ix || !PostMessageW(g_hwnd, WM_APP_APPS, 0, (LPARAM)ix)) {
         if (heap) HeapDestroy(heap);
@@ -837,6 +941,20 @@ static void OnQueryChanged(void) {
             wcscpy(r->sub, CMDS[i].sub);
         }
         if (g_set.files && !calc && wcslen(g_query) >= 2) {
+            for (int i = 0; g_apps && i < g_apps->nd; i++) {
+                const Dir *d = &g_apps->dirs[i];
+                int s = d->parent < 0 ? -1 : Fuzzy(d->name, g_query);
+                if (s < 0) continue;
+                WCHAR full[1100];
+                DirPath(g_apps, i, full, 1100);
+                Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, s - 10 + PathBonus(full) + HistBonus(HistCount(L"", full)));
+                if (!r) continue;
+                r->kind = K_FOLDER;
+                lstrcpynW(r->title, d->name, 160);
+                lstrcpynW(r->target, full, 1100);
+                DirPath(g_apps, d->parent, r->sub, 400);
+                if (r->sub[0] && !r->sub[2]) wcscat(r->sub, L"\\");  // "C:" -> "C:\"
+            }
             if (QueryEverything(g_query)) {
                 g_fileSource = FS_EVERYTHING;
             } else {
@@ -859,9 +977,11 @@ static void OnQueryChanged(void) {
 }
 
 static void AddFile(const WCHAR *name, const WCHAR *dir, const WCHAR *full, BOOL folder) {
+    for (int i = 0; i < g_nlocal; i++)  // already listed from our own folder scan
+        if (!_wcsicmp(g_local[i].target, full)) return;
     int s = Fuzzy(name, g_query);
     if (s < 0) s = 0;
-    s += HistBonus(HistCount(L"", full)) - 10;
+    s += HistBonus(HistCount(L"", full)) + PathBonus(full) - 10;
     Result *r = Slot(g_files, &g_nfiles, MAX_ROWS, s);
     if (!r) return;
     r->kind = folder ? K_FOLDER : K_FILE;
@@ -1245,33 +1365,40 @@ static BOOL SystemUsesDark(void) {
 }
 
 static DWORD BackgroundPixel(void) {
-    if (g_set.backdrop == BD_ACRYLIC && g_acrylic) return 0;  // DWM draws the blurred tint
-    return Premul(g_pal.tint, g_set.backdrop == BD_SOLID ? 255 : g_set.opacity * 255 / 100);
+    if (g_set.backdrop == BD_SOLID) return Premul(g_pal.tint, 255);
+    if (g_blur == BLUR_ACCENT) return 0;  // the accent's own tint carries the opacity
+    if (g_blur == BLUR_SYSTEM) return Premul(g_pal.tint, (g_set.opacity - 20) * 230 / 80);  // extra tint over the system's
+    return Premul(g_pal.tint, g_set.opacity * 255 / 100);  // clear glass
 }
 
-// DWM sometimes drops the accent while the window is hidden, which leaves an unblurred tint,
-// so this runs on every show as well as when settings change.
+// Acrylic uses the Windows 11 system backdrop (the Start menu's material), which blurs every kind
+// of window behind it, GPU-drawn browsers included. It needs a window frame, which WM_NCCALCSIZE
+// hides. Before Windows 11 22H2 it falls back to the undocumented accent policy, which reliably
+// blurs only classic GDI windows. Applied at startup, on settings changes, and on every show.
 static void ApplyBackdrop(void) {
-    BOOL dark = g_pal.dark;
+    BOOL dark = g_pal.dark, acrylic = g_set.backdrop == BD_ACRYLIC;
+    MARGINS mg = {-1, -1, -1, -1};  // DWM honours our alpha everywhere in the client area
+    DwmExtendFrameIntoClientArea(g_hwnd, &mg);
+    DWORD corner = 2;  // DWMWCP_ROUND
+    DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof dark);                  // DWMWA_USE_IMMERSIVE_DARK_MODE
+    DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof corner);              // DWMWA_WINDOW_CORNER_PREFERENCE
+    DwmSetWindowAttribute(g_hwnd, 34, &g_pal.border, sizeof g_pal.border);  // DWMWA_BORDER_COLOR
+
+    int type = acrylic ? 3 : 1;  // DWMSBT_TRANSIENTWINDOW : DWMSBT_NONE
+    BOOL system = SUCCEEDED(DwmSetWindowAttribute(g_hwnd, 38, &type, sizeof type)) && acrylic;  // DWMWA_SYSTEMBACKDROP_TYPE
+
     static SetWindowCompositionAttributeFn swca;
     if (!swca) swca = (SetWindowCompositionAttributeFn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-    AccentPolicy ap = {0};
-    if (g_set.backdrop == BD_ACRYLIC) {
+    AccentPolicy ap = {0};  // AccentState 0 clears it
+    if (acrylic && !system) {
         DWORD a = (DWORD)(g_set.opacity * 255 / 100);
         ap.AccentState = 4;  // ACCENT_ENABLE_ACRYLICBLURBEHIND
         ap.AccentFlags = 2;
         ap.GradientColor = (a << 24) | ((DWORD)GetBValue(g_pal.tint) << 16) | ((DWORD)GetGValue(g_pal.tint) << 8) | GetRValue(g_pal.tint);
     }
     WinCompAttrData data = {19 /* WCA_ACCENT_POLICY */, &ap, sizeof ap};
-    BOOL ok = swca && swca(g_hwnd, &data);
-    g_acrylic = ok && g_set.backdrop == BD_ACRYLIC;
-
-    MARGINS mg = {-1, -1, -1, -1};  // DWM honours our alpha everywhere in the client area
-    DwmExtendFrameIntoClientArea(g_hwnd, &mg);
-    DWORD corner = 2;  // DWMWCP_ROUND
-    DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof dark);              // DWMWA_USE_IMMERSIVE_DARK_MODE
-    DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof corner);          // DWMWA_WINDOW_CORNER_PREFERENCE
-    DwmSetWindowAttribute(g_hwnd, 34, &g_pal.border, sizeof g_pal.border);  // DWMWA_BORDER_COLOR
+    BOOL accent = swca && swca(g_hwnd, &data) && ap.AccentState;
+    g_blur = system ? BLUR_SYSTEM : accent ? BLUR_ACCENT : BLUR_NONE;
 }
 
 static void ApplyAppearance(void) {
@@ -2039,6 +2166,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CAPTURECHANGED:
         g_dragging = FALSE;
         return 0;
+    case WM_NCCALCSIZE:
+        if (wp) return 0;  // the client area covers the whole window: no visible frame
+        break;
+    case WM_NCHITTEST:
+        return HTCLIENT;  // no resize borders
+    case WM_SYSCOMMAND:
+        switch (wp & 0xFFF0) {
+        case SC_SIZE: case SC_MOVE: case SC_MINIMIZE: case SC_MAXIMIZE: case SC_RESTORE: return 0;
+        }
+        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
@@ -2123,7 +2260,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
     wc.hIconSm = g_icon;
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WND_CLASS, APP_NAME, WS_POPUP, 0, 0, 100, 100, NULL, NULL, inst, NULL);
+    // WS_THICKFRAME only so DWM gives the window a frame (needed for the system backdrop); it is
+    // hidden by WM_NCCALCSIZE and resizing is blocked in WM_NCHITTEST / WM_SYSCOMMAND.
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WND_CLASS, APP_NAME, WS_POPUP | WS_THICKFRAME,
+                             0, 0, 100, 100, NULL, NULL, inst, NULL);
+    SetWindowPos(g_hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     g_measureDC = CreateCompatibleDC(NULL);
     InitCoverageBoost();
     g_dpi = GetDpiForWindow(g_hwnd);

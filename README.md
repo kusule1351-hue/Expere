@@ -9,7 +9,7 @@ Press **Alt+Space**, type, press **Enter**.
 | Search for | Gets you |
 | --- | --- |
 | App names, acronyms (`vsc` → Visual Studio Code) | Every app in Start, including Store apps |
-| File and folder names | Results from the Windows Search index (or Everything, if it is running) |
+| File and folder names | Files and folders from the Windows Search index (or Everything, if it is running), plus folders anywhere on your local drives that Windows does not index, such as `C:\Projects` |
 | `2^10`, `sqrt(2)*10`, `15% 4` | Calculator; Enter copies the result |
 | `lock`, `sleep`, `restart`, `shut down`, `sign out`, `empty recycle bin` | System commands (power actions ask first) |
 | `expere settings` | The settings window |
@@ -72,6 +72,9 @@ Where the savings come from:
    A web-tech launcher pays for one or more renderer processes and a JS heap before it shows a single result.
 2. **No file index in our process.** File search asks the Windows Search index, which Windows already keeps
    running. Expere connects over OLE DB only while the window is open and disconnects on hide.
+   Windows only indexes your user folder, so Expere also keeps the *names* of folders elsewhere on local drives
+   (5 levels deep, skipping Windows, Program Files, hidden folders, `node_modules` and dot-folders): about
+   700 folders and ~30 KB on this PC, stored as a name plus a parent link rather than full paths.
    Everything is used if its client is *already* running, but Expere never starts it: on this machine
    Everything's full-disk index cost ~245 MB across its client and service, which is the same problem moved elsewhere.
 3. **Transparency without a big back buffer.** The blur is done by Windows (DWM). Expere draws the window in
@@ -90,8 +93,11 @@ shared pages of system DLLs such as `shell32.dll` that Explorer has loaded anywa
 ## How the transparency works
 
 The client area is covered by `DwmExtendFrameIntoClientArea`, so DWM composites the window using the alpha channel
-of what Expere paints. Acrylic comes from the window's accent policy (`SetWindowCompositionAttribute`, the same
-mechanism the taskbar uses; the documented `DWMWA_SYSTEMBACKDROP_TYPE` only paints flat grey on a borderless popup).
+of what Expere paints. Acrylic is the Windows 11 system backdrop (`DWMWA_SYSTEMBACKDROP_TYPE` = transient window,
+the Start menu's material), which blurs every window behind it, GPU-drawn browsers included. It only works on a window
+with a frame, so the window has `WS_THICKFRAME` and hides it in `WM_NCCALCSIZE`. The Opacity slider paints extra
+tint on top. Before Windows 11 22H2 Expere falls back to the undocumented accent policy
+(`SetWindowCompositionAttribute`), which reliably blurs only classic GDI windows.
 GDI writes no alpha, so text is rendered with ClearType into a mask and blended in from its coverage: over the
 **Solid** background every colour channel uses its own coverage (real ClearType); over see-through backgrounds DWM
 has only one alpha per pixel, so the subpixel coverages are merged into sharp grayscale text. **For the crispest text,
