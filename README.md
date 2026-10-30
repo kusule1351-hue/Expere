@@ -1,7 +1,8 @@
 # Expere
 
 A keyboard launcher for Windows in the spirit of Raycast / Spotlight, built to use as little memory as possible.
-One C file, plain Win32, 112 KB executable, no runtime to install.
+One C file, plain Win32, ~145 KB executable, no runtime to install. The window is see-through (blurred acrylic by
+default) and follows your Windows light/dark theme.
 
 Press **Alt+Space**, type, press **Enter**.
 
@@ -11,12 +12,31 @@ Press **Alt+Space**, type, press **Enter**.
 | File and folder names | Results from the Windows Search index (or Everything, if it is running) |
 | `2^10`, `sqrt(2)*10`, `15% 4` | Calculator; Enter copies the result |
 | `lock`, `sleep`, `restart`, `shut down`, `sign out`, `empty recycle bin` | System commands (power actions ask first) |
+| `expere settings` | The settings window |
 | Anything | Web search fallback as the last row |
 
-Keys: `↑` `↓` / `Tab` move, `Enter` open, `Ctrl+Enter` show in folder, `Esc` clear then close, `Ctrl+Backspace` delete word.
+Keys: `↑` `↓` / `Tab` move, `Enter` open, `Ctrl+Enter` show in folder, `Esc` clear then close, `Ctrl+,` settings.
+The search box supports the usual editing keys: `Ctrl+←/→`, `Shift`-selection, `Ctrl+A/C/X/V`, `Ctrl+Backspace`.
 Things you open often rank higher (counts are kept in `%APPDATA%\Expere\history.txt`).
 
-Tray icon: left-click opens, right-click has **Start with Windows** and **Quit**.
+Tray icon: left-click opens, right-click has **Settings…** and **Quit**.
+
+## Settings
+
+Open with `Ctrl+,`, the tray menu, or by typing `expere settings`. Saved to `%APPDATA%\Expere\settings.ini`.
+
+| Setting | Options |
+| --- | --- |
+| Shortcut | Alt / Ctrl / Ctrl+Alt / Ctrl+Shift / Alt+Shift / Win+Alt / Win+Shift + Space, `` ` ``, A–Z, 0–9, F1–F12. A shortcut another app already owns is refused with a message. |
+| Theme | Follow Windows, Dark, Light |
+| Background | **Acrylic** (blurred, like the Start menu), **Transparent** (clear tinted glass), **Solid** |
+| Opacity | 20–100 %: how strong the tint is over the blur or glass |
+| Results shown | 3–10 rows |
+| Web search | Google, Bing, DuckDuckGo, Brave Search |
+| Include files and folders | Turn file search off to keep results to apps and commands |
+| Start with Windows | Adds/removes Expere from `HKCU\…\Run` |
+| Keep the last search | Reopen with the previous query selected instead of an empty box |
+| Clear usage history | Resets the "opened often" ranking |
 
 ## Build
 
@@ -31,41 +51,52 @@ powershell -File build.ps1
 ```bash
 expere.exe                 # start (or open the launcher if already running)
 expere.exe --background    # start in the tray without a notification
+expere.exe --settings      # open the settings window
 expere.exe some text       # open the launcher with "some text" typed in
 expere.exe --quit          # stop the running instance
 ```
 
 ## Memory
 
-Measured on this machine (Windows 11, Task Manager's "Memory" column = private working set):
+Measured on this machine (Windows 11, Task Manager's "Memory" column = private working set), default acrylic background:
 
 | State | Private working set | Commit |
 | --- | --- | --- |
 | Idle in tray after start | 0.2 MB | 6 MB |
-| Open, after five searches | 4.9 MB | 8.8 MB |
-| Hidden again | 0.5–1.7 MB | 8 MB |
+| Open, after five searches | 5.4 MB | 9.3 MB |
+| Hidden again | 0.3–1.7 MB | 8 MB |
 
 Where the savings come from:
 
-1. **No browser engine, no JavaScript.** The UI is one Win32 window with a native edit control, painted with GDI.
+1. **No browser engine, no JavaScript.** The UI is one Win32 window painted by our own code.
    A web-tech launcher pays for one or more renderer processes and a JS heap before it shows a single result.
 2. **No file index in our process.** File search asks the Windows Search index, which Windows already keeps
    running. Expere connects over OLE DB only while the window is open and disconnects on hide.
    Everything is used if its client is *already* running, but Expere never starts it: on this machine
    Everything's full-disk index cost ~245 MB across its client and service, which is the same problem moved elsewhere.
-3. **Apps live in a private heap.** The Start apps list is a few hundred strings in its own `HeapCreate` heap; a refresh
+3. **Transparency without a big back buffer.** The blur is done by Windows (DWM). Expere draws the window in
+   row-high strips with per-pixel alpha, so even a tall window at 150 % scaling needs well under 1 MB of buffers,
+   and those are freed when the window hides.
+4. **Apps live in a private heap.** The Start apps list is a few hundred strings in its own `HeapCreate` heap; a refresh
    builds a new heap on a background thread and frees the old one with a single `HeapDestroy`, so nothing fragments.
-4. **Icons are borrowed and lazy.** Icons come from the system image list (shared with Explorer) and are looked up only
-   for the eight rows on screen.
-5. **Fixed-size results.** The candidate lists are capped at eight entries and kept sorted on insert; no growing arrays.
+5. **Icons are borrowed and lazy.** Icons come from the system image list (shared with Explorer) and are looked up only
+   for the rows on screen; built-in commands use the Segoe Fluent Icons font that ships with Windows.
 6. **Trim on hide.** Closing the window calls `SetProcessWorkingSetSize(-1, -1)` (again 20 s later), returning pages
    to Windows. They sit on the standby list, so reopening is still instant.
 
 The large "Working set" figure you may see in other tools while the window is open (~40 MB) is almost entirely
 shared pages of system DLLs such as `shell32.dll` that Explorer has loaded anyway; it is not memory Expere owns.
 
+## How the transparency works
+
+The client area is covered by `DwmExtendFrameIntoClientArea`, so DWM composites the window using the alpha channel
+of what Expere paints. Acrylic comes from the window's accent policy (`SetWindowCompositionAttribute`, the same
+mechanism the taskbar uses; the documented `DWMWA_SYSTEMBACKDROP_TYPE` only paints flat grey on a borderless popup).
+GDI writes no alpha, so text is rendered white-on-black into a mask and blended in with its coverage, and icons get
+their alpha by drawing them over black and over white. For that reason the search box is a small custom control
+rather than a Windows edit box; it supports IME input, but screen readers will not see it as a text field.
+
 ## Tuning
 
 - Paths hidden from file results: `WS_EXCLUDE` / `EV_EXCLUDE` in `expere.c` (AppData, node_modules, dot-folders, Start Menu).
-- Hotkey: `RegisterHotKey(... MOD_ALT, VK_SPACE)` in `wWinMain`.
-- Web search engine: the URL in `OnQueryChanged`.
+- Colours for the two themes: `PAL_DARK` / `PAL_LIGHT` in `expere.c`.

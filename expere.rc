@@ -1,2 +1,43 @@
-#include <winuser.h>
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
 1 RT_MANIFEST "expere.manifest"
+
+IDD_SETTINGS DIALOGEX 0, 0, 276, 292
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Expere Settings"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Shortcut", -1, 8, 6, 260, 36
+    LTEXT           "Open Expere with", -1, 16, 22, 76, 8
+    COMBOBOX        IDC_HOTMOD, 96, 19, 78, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CTEXT           "+", -1, 176, 22, 10, 8
+    COMBOBOX        IDC_HOTKEY, 188, 19, 72, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    GROUPBOX        "Appearance", -1, 8, 48, 260, 72
+    LTEXT           "Theme", -1, 16, 64, 76, 8
+    COMBOBOX        IDC_THEME, 96, 61, 164, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Background", -1, 16, 82, 76, 8
+    COMBOBOX        IDC_BACKDROP, 96, 79, 164, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Opacity", -1, 16, 101, 76, 8
+    CONTROL         "", IDC_OPACITY, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 92, 98, 140, 14
+    LTEXT           "", IDC_OPACITY_VAL, 236, 101, 26, 8
+
+    GROUPBOX        "Search", -1, 8, 126, 260, 70
+    LTEXT           "Results shown", -1, 16, 142, 76, 8
+    COMBOBOX        IDC_MAXRESULTS, 96, 139, 60, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Web search", -1, 16, 160, 76, 8
+    COMBOBOX        IDC_ENGINE, 96, 157, 164, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    AUTOCHECKBOX    "Include files and folders", IDC_FILES, 16, 177, 200, 10, WS_TABSTOP
+
+    GROUPBOX        "General", -1, 8, 202, 260, 66
+    AUTOCHECKBOX    "Start with Windows", IDC_STARTUP, 16, 216, 200, 10, WS_TABSTOP
+    AUTOCHECKBOX    "Keep the last search when reopening", IDC_KEEPQUERY, 16, 230, 200, 10, WS_TABSTOP
+    PUSHBUTTON      "Clear usage history", IDC_CLEARHIST, 16, 246, 84, 14, WS_TABSTOP
+
+    DEFPUSHBUTTON   "OK", IDOK, 112, 272, 50, 14, WS_TABSTOP
+    PUSHBUTTON      "Cancel", IDCANCEL, 166, 272, 50, 14, WS_TABSTOP
+    PUSHBUTTON      "Apply", IDC_APPLY, 220, 272, 48, 14, WS_TABSTOP
+END
