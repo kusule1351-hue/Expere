@@ -92,9 +92,12 @@ shared pages of system DLLs such as `shell32.dll` that Explorer has loaded anywa
 The client area is covered by `DwmExtendFrameIntoClientArea`, so DWM composites the window using the alpha channel
 of what Expere paints. Acrylic comes from the window's accent policy (`SetWindowCompositionAttribute`, the same
 mechanism the taskbar uses; the documented `DWMWA_SYSTEMBACKDROP_TYPE` only paints flat grey on a borderless popup).
-GDI writes no alpha, so text is rendered white-on-black into a mask and blended in with its coverage, and icons get
-their alpha by drawing them over black and over white. For that reason the search box is a small custom control
-rather than a Windows edit box; it supports IME input, but screen readers will not see it as a text field.
+GDI writes no alpha, so text is rendered with ClearType into a mask and blended in from its coverage: over the
+**Solid** background every colour channel uses its own coverage (real ClearType); over see-through backgrounds DWM
+has only one alpha per pixel, so the subpixel coverages are merged into sharp grayscale text. **For the crispest text,
+choose Solid.** Icons get their alpha by drawing them over black and over white, at their native 32/48 px size, and are
+then resampled to the display scale instead of being stretched. For the same alpha reason the search box is a small
+custom control rather than a Windows edit box; it supports IME input, but screen readers will not see it as a text field.
 
 ## Tuning
 

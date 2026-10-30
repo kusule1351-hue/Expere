@@ -180,6 +180,7 @@ static HFONT g_fEdit, g_fTitle, g_fSub, g_fGlyph;  // g_fGlyph: icon font for co
 static HDC g_measureDC;
 static int g_editTextH;
 static HIMAGELIST g_iml;
+static int g_imlSize;  // native pixel size of the icons in g_iml
 static HICON g_icon, g_iconBig;
 static UINT g_dpi = 96;
 static RECT g_work;
@@ -191,6 +192,7 @@ static Palette g_pal;
 
 // Strip renderer: g_band holds rows [g_bandY, g_bandY + g_bandH) of the window.
 static Dib g_band, g_mask, g_icoK, g_icoW;
+static DWORD *g_iconScratch;  // native-size icon + resampled icon, allocated while visible
 static int g_bandY, g_bandH;
 
 // Search box.
@@ -959,6 +961,8 @@ static void FreeBuffers(void) {
     DibFree(&g_mask);
     DibFree(&g_icoK);
     DibFree(&g_icoW);
+    if (g_iconScratch) HeapFree(GetProcessHeap(), 0, g_iconScratch);
+    g_iconScratch = NULL;
 }
 
 static DWORD Premul(COLORREF c, int a) {
@@ -998,53 +1002,119 @@ static void FillRound(int l, int t, int r, int b, int rad, COLORREF c, int alpha
     }
 }
 
-// GDI writes no alpha, so text is drawn white-on-black into a mask and its coverage blended in.
+// Averaged subpixel coverage blended in sRGB makes strokes look thin; lift the edges like
+// DirectWrite's contrast enhancement does. Filled in by InitCoverageBoost.
+static BYTE g_coverageBoost[256];
+
+static void InitCoverageBoost(void) {
+    for (int i = 0; i < 256; i++) g_coverageBoost[i] = (BYTE)(255.0 * pow(i / 255.0, 0.75) + 0.5);
+}
+
+// GDI writes no alpha, so text is rendered with ClearType into a mask (light text white-on-black,
+// dark text black-on-white, so GDI applies the right gamma) and blended in from its coverage.
+// Over opaque pixels each colour channel gets its own coverage: real ClearType. Over see-through
+// pixels DWM only knows one alpha per pixel, so the three subpixel coverages are averaged.
 static void PaintText(const WCHAR *s, int n, RECT r, HFONT f, UINT fmt, COLORREF c, const RECT *clip) {
     RECT a = r, band = {0, g_bandY, g_band.w, g_bandY + g_bandH};
     if (clip && !IntersectRect(&a, &a, clip)) return;
     if (!IntersectRect(&a, &a, &band)) return;
-    for (int y = a.top; y < a.bottom; y++)
-        memset(g_mask.px + (y - g_bandY) * g_mask.w + a.left, 0, (a.right - a.left) * sizeof(DWORD));
+    int cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
+    BOOL light = cr * 299 + cg * 587 + cb * 114 >= 128000;
+    DWORD blank = light ? 0 : 0x00FFFFFF, flip = light ? 0 : 255;
+    for (int y = a.top; y < a.bottom; y++) {
+        DWORD *m = g_mask.px + (y - g_bandY) * g_mask.w;
+        for (int x = a.left; x < a.right; x++) m[x] = blank;
+    }
     SetViewportOrgEx(g_mask.dc, 0, -g_bandY, NULL);
     HGDIOBJ of = SelectObject(g_mask.dc, f);
-    SetTextColor(g_mask.dc, RGB(255, 255, 255));
+    SetTextColor(g_mask.dc, light ? RGB(255, 255, 255) : RGB(0, 0, 0));
     DrawTextW(g_mask.dc, s, n, &r, fmt | DT_NOPREFIX);
     SelectObject(g_mask.dc, of);
     GdiFlush();
-    int cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
     for (int y = a.top; y < a.bottom; y++) {
         DWORD *m = g_mask.px + (y - g_bandY) * g_mask.w, *d = g_band.px + (y - g_bandY) * g_band.w;
         for (int x = a.left; x < a.right; x++) {
             DWORD v = m[x];
-            int cov = Max(Max((v >> 16) & 255, (v >> 8) & 255), v & 255);
-            if (cov) Over(&d[x], ((DWORD)cov << 24) | ((DWORD)(cr * cov / 255) << 16) | ((DWORD)(cg * cov / 255) << 8) | (DWORD)(cb * cov / 255));
+            int kr = ((v >> 16) & 255) ^ flip, kg = ((v >> 8) & 255) ^ flip, kb = (v & 255) ^ flip;
+            if (!(kr | kg | kb)) continue;
+            DWORD p = d[x];
+            if ((p >> 24) == 255) {
+                int pr = (p >> 16) & 255, pg = (p >> 8) & 255, pb = p & 255;
+                d[x] = 0xFF000000 | ((DWORD)((cr * kr + pr * (255 - kr)) / 255) << 16) |
+                       ((DWORD)((cg * kg + pg * (255 - kg)) / 255) << 8) | (DWORD)((cb * kb + pb * (255 - kb)) / 255);
+            } else {
+                int cov = g_coverageBoost[(Max(Max(kr, kg), kb) + (kr + kg + kb) / 3) / 2];
+                Over(&d[x], ((DWORD)cov << 24) | ((DWORD)(cr * cov / 255) << 16) | ((DWORD)(cg * cov / 255) << 8) | (DWORD)(cb * cov / 255));
+            }
+        }
+    }
+}
+
+// Premultiplied image scaling: area average when shrinking, bilinear when enlarging.
+static void Resample(const DWORD *src, int n, DWORD *dst, int m) {
+    if (n == m) { memcpy(dst, src, n * n * sizeof(DWORD)); return; }
+    float sc = (float)n / m;
+    for (int dy = 0; dy < m; dy++) {
+        for (int dx = 0; dx < m; dx++) {
+            float acc[4] = {0}, wsum = 0;
+            if (m < n) {
+                float y0 = dy * sc, y1 = y0 + sc, x0 = dx * sc, x1 = x0 + sc;
+                for (int sy = (int)y0; sy < n && sy < y1; sy++) {
+                    float wy = fminf(y1, sy + 1.f) - fmaxf(y0, (float)sy);
+                    for (int sx = (int)x0; sx < n && sx < x1; sx++) {
+                        float w = wy * (fminf(x1, sx + 1.f) - fmaxf(x0, (float)sx));
+                        if (w <= 0) continue;
+                        DWORD p = src[sy * n + sx];
+                        acc[0] += w * (p >> 24); acc[1] += w * ((p >> 16) & 255); acc[2] += w * ((p >> 8) & 255); acc[3] += w * (p & 255);
+                        wsum += w;
+                    }
+                }
+            } else {
+                float fy = fmaxf((dy + 0.5f) * sc - 0.5f, 0), fx = fmaxf((dx + 0.5f) * sc - 0.5f, 0);
+                int y0 = (int)fy, x0 = (int)fx, y1 = Min(y0 + 1, n - 1), x1 = Min(x0 + 1, n - 1);
+                float ty = fy - y0, tx = fx - x0;
+                DWORD q[4] = {src[y0 * n + x0], src[y0 * n + x1], src[y1 * n + x0], src[y1 * n + x1]};
+                float w[4] = {(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty};
+                for (int k = 0; k < 4; k++) {
+                    acc[0] += w[k] * (q[k] >> 24); acc[1] += w[k] * ((q[k] >> 16) & 255);
+                    acc[2] += w[k] * ((q[k] >> 8) & 255); acc[3] += w[k] * (q[k] & 255);
+                }
+                wsum = 1;
+            }
+            DWORD out = 0;
+            for (int k = 0; k < 4; k++) out = (out << 8) | (DWORD)Min(255, (int)(acc[k] / wsum + 0.5f));
+            dst[dy * m + dx] = out;
         }
     }
 }
 
 // Alpha recovered from drawing the icon over black and over white: works for every icon format.
+// The icon is drawn at its native size and resampled, never stretched by GDI.
 static void DrawIconAlpha(HICON hic, int x, int y, int sz) {
-    if (y + sz <= g_bandY || y >= g_bandY + g_bandH) return;
-    if (!DibEnsure(&g_icoK, sz, sz) || !DibEnsure(&g_icoW, sz, sz)) return;
-    memset(g_icoK.px, 0, sz * sz * sizeof(DWORD));
-    for (int i = 0; i < sz * sz; i++) g_icoW.px[i] = 0x00FFFFFF;
-    DrawIconEx(g_icoK.dc, 0, 0, hic, sz, sz, 0, NULL, DI_NORMAL);
-    DrawIconEx(g_icoW.dc, 0, 0, hic, sz, sz, 0, NULL, DI_NORMAL);
+    int n = g_imlSize;
+    if (y + sz <= g_bandY || y >= g_bandY + g_bandH || n <= 0 || n > 64 || sz > 128) return;
+    if (!g_iconScratch) g_iconScratch = HeapAlloc(GetProcessHeap(), 0, (64 * 64 + 128 * 128) * sizeof(DWORD));
+    if (!g_iconScratch || !DibEnsure(&g_icoK, n, n) || !DibEnsure(&g_icoW, n, n)) return;
+    DWORD *native = g_iconScratch, *scaled = g_iconScratch + 64 * 64;
+    memset(g_icoK.px, 0, n * n * sizeof(DWORD));
+    for (int i = 0; i < n * n; i++) g_icoW.px[i] = 0x00FFFFFF;
+    DrawIconEx(g_icoK.dc, 0, 0, hic, n, n, 0, NULL, DI_NORMAL);
+    DrawIconEx(g_icoW.dc, 0, 0, hic, n, n, 0, NULL, DI_NORMAL);
     GdiFlush();
+    for (int i = 0; i < n * n; i++) {
+        DWORD k = g_icoK.px[i], w = g_icoW.px[i];
+        int kr = (k >> 16) & 255, kg = (k >> 8) & 255, kb = k & 255;
+        int diff = ((int)((w >> 16) & 255) - kr + (int)((w >> 8) & 255) - kg + (int)(w & 255) - kb) / 3;
+        int a = Max(0, Min(255, 255 - diff));
+        native[i] = ((DWORD)a << 24) | ((DWORD)Min(kr, a) << 16) | ((DWORD)Min(kg, a) << 8) | (DWORD)Min(kb, a);
+    }
+    Resample(native, n, scaled, sz);
     for (int yy = 0; yy < sz; yy++) {
         int by = y + yy - g_bandY;
         if (by < 0 || by >= g_bandH) continue;
         for (int xx = 0; xx < sz; xx++) {
             int bx = x + xx;
-            if (bx < 0 || bx >= g_band.w) continue;
-            DWORD k = g_icoK.px[yy * sz + xx], w = g_icoW.px[yy * sz + xx];
-            int kr = (k >> 16) & 255, kg = (k >> 8) & 255, kb = k & 255;
-            int diff = ((int)((w >> 16) & 255) - kr + (int)((w >> 8) & 255) - kg + (int)(w & 255) - kb) / 3;
-            int a = 255 - diff;
-            if (a <= 0) continue;
-            if (a > 255) a = 255;
-            Over(&g_band.px[by * g_band.w + bx],
-                 ((DWORD)a << 24) | ((DWORD)Min(kr, a) << 16) | ((DWORD)Min(kg, a) << 8) | (DWORD)Min(kb, a));
+            if (bx >= 0 && bx < g_band.w) Over(&g_band.px[by * g_band.w + bx], scaled[yy * sz + xx]);
         }
     }
 }
@@ -1179,10 +1249,10 @@ static DWORD BackgroundPixel(void) {
     return Premul(g_pal.tint, g_set.backdrop == BD_SOLID ? 255 : g_set.opacity * 255 / 100);
 }
 
-static void ApplyAppearance(void) {
-    BOOL dark = g_set.theme == THEME_DARK || (g_set.theme == THEME_SYSTEM && SystemUsesDark());
-    g_pal = dark ? PAL_DARK : PAL_LIGHT;
-
+// DWM sometimes drops the accent while the window is hidden, which leaves an unblurred tint,
+// so this runs on every show as well as when settings change.
+static void ApplyBackdrop(void) {
+    BOOL dark = g_pal.dark;
     static SetWindowCompositionAttributeFn swca;
     if (!swca) swca = (SetWindowCompositionAttributeFn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
     AccentPolicy ap = {0};
@@ -1202,6 +1272,12 @@ static void ApplyAppearance(void) {
     DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof dark);              // DWMWA_USE_IMMERSIVE_DARK_MODE
     DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof corner);          // DWMWA_WINDOW_CORNER_PREFERENCE
     DwmSetWindowAttribute(g_hwnd, 34, &g_pal.border, sizeof g_pal.border);  // DWMWA_BORDER_COLOR
+}
+
+static void ApplyAppearance(void) {
+    BOOL dark = g_set.theme == THEME_DARK || (g_set.theme == THEME_SYSTEM && SystemUsesDark());
+    g_pal = dark ? PAL_DARK : PAL_LIGHT;
+    ApplyBackdrop();
     if (IsWindowVisible(g_hwnd)) { Merge(); Relayout(); }
 }
 
@@ -1360,7 +1436,7 @@ static int RowAt(int y) {
 static HFONT MakeFont(int px, int weight, const WCHAR *face) {
     // Grayscale AA: ClearType needs an opaque background to blend against.
     return CreateFontW(-S(px), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
 }
 
 static void CreateFonts(void) {
@@ -1381,7 +1457,13 @@ static void CreateFonts(void) {
     SelectObject(g_measureDC, g_fEdit);
     GetTextMetricsW(g_measureDC, &tm);
     g_editTextH = tm.tmHeight;
-    SHGetImageList(g_dpi > 120 ? SHIL_EXTRALARGE : SHIL_LARGE, &kIidImageList, (void **)&g_iml);
+    // Use the smallest system list at least as large as the drawn icon, then scale down:
+    // stretching the 32 px list up to 40 px (125% scaling) is what made icons soft.
+    BOOL large = S(32) > 32;
+    SHGetImageList(large ? SHIL_EXTRALARGE : SHIL_LARGE, &kIidImageList, (void **)&g_iml);
+    g_imlSize = large ? 48 : 32;
+    int cx, cy;
+    if (g_iml && ImageList_GetIconSize(g_iml, &cx, &cy)) g_imlSize = cx;
 }
 
 // ---------------------------------------------------------------- show / hide / actions
@@ -1426,6 +1508,7 @@ static void ShowLauncher(const WCHAR *text) {
     OnQueryChanged();
 
     ShowWindow(g_hwnd, SW_SHOW);
+    ApplyBackdrop();
     if (!SetForegroundWindow(g_hwnd)) {
         // Opened from a process without foreground rights (tray, second instance): borrow the input queue.
         DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), NULL), me = GetCurrentThreadId();
@@ -2042,6 +2125,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
 
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WND_CLASS, APP_NAME, WS_POPUP, 0, 0, 100, 100, NULL, NULL, inst, NULL);
     g_measureDC = CreateCompatibleDC(NULL);
+    InitCoverageBoost();
     g_dpi = GetDpiForWindow(g_hwnd);
     CreateFonts();
     ApplyAppearance();
