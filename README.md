@@ -9,13 +9,15 @@ Press **Alt+Space**, type, press **Enter**.
 | Search for | Gets you |
 | --- | --- |
 | App names, acronyms (`vsc` → Visual Studio Code) | Every app in Start, including Store apps |
-| File and folder names | Results from the Windows Search index (or Everything, if it is running) |
+| File and folder names | Files and folders from the Windows Search index (or Everything, if it is running), plus folders anywhere on your local drives that Windows does not index, such as `C:\Projects` |
 | `2^10`, `sqrt(2)*10`, `15% 4` | Calculator; Enter copies the result |
 | `lock`, `sleep`, `restart`, `shut down`, `sign out`, `empty recycle bin` | System commands (power actions ask first) |
 | `expere settings` | The settings window |
 | Anything | Web search fallback as the last row |
 
-Keys: `↑` `↓` / `Tab` move, `Enter` open, `Ctrl+Enter` show in folder, `Esc` clear then close, `Ctrl+,` settings.
+Keys: `↑` `↓` / `Tab` move, `PgUp` `PgDn` jump a page, `Enter` open, `Ctrl+Enter` show in folder, `Esc` clear then
+close, `Ctrl+,` settings. When there are more results than rows, scroll with the wheel or touchpad, or drag the
+scroll bar on the right; the web search is always the last item.
 The search box supports the usual editing keys: `Ctrl+←/→`, `Shift`-selection, `Ctrl+A/C/X/V`, `Ctrl+Backspace`.
 Things you open often rank higher (counts are kept in `%APPDATA%\Expere\history.txt`).
 
@@ -31,7 +33,7 @@ Open with `Ctrl+,`, the tray menu, or by typing `expere settings`. Saved to `%AP
 | Theme | Follow Windows, Dark, Light |
 | Background | **Acrylic** (blurred, like the Start menu), **Transparent** (clear tinted glass), **Solid** |
 | Opacity | 20–100 %: how strong the tint is over the blur or glass |
-| Results shown | 3–10 rows |
+| Visible rows | 3–10 rows on screen; up to 61 results scroll |
 | Web search | Google, Bing, DuckDuckGo, Brave Search |
 | Include files and folders | Turn file search off to keep results to apps and commands |
 | Start with Windows | Adds/removes Expere from `HKCU\…\Run` |
@@ -72,6 +74,9 @@ Where the savings come from:
    A web-tech launcher pays for one or more renderer processes and a JS heap before it shows a single result.
 2. **No file index in our process.** File search asks the Windows Search index, which Windows already keeps
    running. Expere connects over OLE DB only while the window is open and disconnects on hide.
+   Windows only indexes your user folder, so Expere also keeps the *names* of folders elsewhere on local drives
+   (5 levels deep, skipping Windows, Program Files, hidden folders, `node_modules` and dot-folders): about
+   700 folders and ~30 KB on this PC, stored as a name plus a parent link rather than full paths.
    Everything is used if its client is *already* running, but Expere never starts it: on this machine
    Everything's full-disk index cost ~245 MB across its client and service, which is the same problem moved elsewhere.
 3. **Transparency without a big back buffer.** The blur is done by Windows (DWM). Expere draws the window in
@@ -90,11 +95,17 @@ shared pages of system DLLs such as `shell32.dll` that Explorer has loaded anywa
 ## How the transparency works
 
 The client area is covered by `DwmExtendFrameIntoClientArea`, so DWM composites the window using the alpha channel
-of what Expere paints. Acrylic comes from the window's accent policy (`SetWindowCompositionAttribute`, the same
-mechanism the taskbar uses; the documented `DWMWA_SYSTEMBACKDROP_TYPE` only paints flat grey on a borderless popup).
-GDI writes no alpha, so text is rendered white-on-black into a mask and blended in with its coverage, and icons get
-their alpha by drawing them over black and over white. For that reason the search box is a small custom control
-rather than a Windows edit box; it supports IME input, but screen readers will not see it as a text field.
+of what Expere paints. Acrylic is the Windows 11 system backdrop (`DWMWA_SYSTEMBACKDROP_TYPE` = transient window,
+the Start menu's material), which blurs every window behind it, GPU-drawn browsers included. It only works on a window
+with a frame, so the window has `WS_THICKFRAME` and hides it in `WM_NCCALCSIZE`. The Opacity slider paints extra
+tint on top. Before Windows 11 22H2 Expere falls back to the undocumented accent policy
+(`SetWindowCompositionAttribute`), which reliably blurs only classic GDI windows.
+GDI writes no alpha, so text is rendered with ClearType into a mask and blended in from its coverage: over the
+**Solid** background every colour channel uses its own coverage (real ClearType); over see-through backgrounds DWM
+has only one alpha per pixel, so the subpixel coverages are merged into sharp grayscale text. **For the crispest text,
+choose Solid.** Icons get their alpha by drawing them over black and over white, at their native 32/48 px size, and are
+then resampled to the display scale instead of being stretched. For the same alpha reason the search box is a small
+custom control rather than a Windows edit box; it supports IME input, but screen readers will not see it as a text field.
 
 ## Tuning
 

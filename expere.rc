@@ -26,7 +26,7 @@ BEGIN
     LTEXT           "", IDC_OPACITY_VAL, 236, 101, 26, 8
 
     GROUPBOX        "Search", -1, 8, 126, 260, 70
-    LTEXT           "Results shown", -1, 16, 142, 76, 8
+    LTEXT           "Visible rows", -1, 16, 142, 76, 8
     COMBOBOX        IDC_MAXRESULTS, 96, 139, 60, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     LTEXT           "Web search", -1, 16, 160, 76, 8
     COMBOBOX        IDC_ENGINE, 96, 157, 164, 80, CBS_DROPDOWNLIST | WS_TABSTOP

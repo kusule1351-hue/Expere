@@ -62,7 +62,9 @@
 #define SEARCH_DELAY_MS  90
 #define TRIM_AGAIN_MS    20000  // shell and COM threads touch pages for a while after we hide
 #define WS_MAX           24
-#define MAX_ROWS         10
+#define MAX_ROWS         10                 // most rows visible at once; the rest scroll
+#define MAX_CAND         30                 // results kept per source (apps+commands+folders, files)
+#define MAX_SHOWN        (2 * MAX_CAND + 1) // plus the web search row
 #define APP_REFRESH_MS   (10 * 60 * 1000)
 
 // WM_COPYDATA tags. Everything replies carry EV_REPLY_BASE | query sequence.
@@ -148,7 +150,16 @@ static const Palette PAL_LIGHT = {RGB(22, 22, 26), RGB(90, 90, 102), RGB(56, 90,
 // ---------------------------------------------------------------- types
 
 typedef struct { WCHAR *name, *parse; } App;
-typedef struct { HANDLE heap; App *items; int n, cap; } AppIndex;
+typedef struct { WCHAR *name; int parent; } Dir;  // folder tree: full paths are rebuilt only for shown results
+typedef struct {
+    HANDLE heap;
+    App *items;
+    int n, cap;
+    Dir *dirs;
+    int nd, capd;
+    WCHAR *arena;  // strings are bump-allocated in chunks; HeapDestroy frees everything at once
+    size_t arenaLeft;
+} AppIndex;
 
 typedef struct {
     int kind, score, icon, cmd;  // icon: -2 = not resolved yet, -1 = none
@@ -180,17 +191,20 @@ static HFONT g_fEdit, g_fTitle, g_fSub, g_fGlyph;  // g_fGlyph: icon font for co
 static HDC g_measureDC;
 static int g_editTextH;
 static HIMAGELIST g_iml;
+static int g_imlSize;  // native pixel size of the icons in g_iml
 static HICON g_icon, g_iconBig;
 static UINT g_dpi = 96;
 static RECT g_work;
 static NOTIFYICONDATAW g_nid;
 static UINT g_wmTaskbarCreated;
 static POINT g_lastMouse;
-static BOOL g_activated, g_hotkeyOk, g_acrylic, g_dragging;
+static BOOL g_activated, g_hotkeyOk, g_dragging;
+static enum { BLUR_NONE, BLUR_SYSTEM, BLUR_ACCENT } g_blur;  // who draws the blurred background
 static Palette g_pal;
 
 // Strip renderer: g_band holds rows [g_bandY, g_bandY + g_bandH) of the window.
 static Dib g_band, g_mask, g_icoK, g_icoW;
+static DWORD *g_iconScratch;  // native-size icon + resampled icon, allocated while visible
 static int g_bandY, g_bandH;
 
 // Search box.
@@ -213,10 +227,12 @@ static WCHAR g_wsQuery[512];
 static DWORD g_wsSeq;
 static BOOL g_wsPending, g_wsRelease;
 
-static Result g_local[MAX_ROWS], g_files[MAX_ROWS], g_extra;
+static Result *g_local, *g_files, g_extra;  // MAX_CAND each, allocated only while the window is shown
 static int g_nlocal, g_nfiles;
-static Result *g_shown[MAX_ROWS];
-static int g_nshown, g_sel;
+static Result *g_shown[MAX_SHOWN];
+static int g_nshown, g_sel, g_top;  // g_top: first visible row
+static int g_wheelAcc, g_sbGrab;    // wheel remainder; where the scroll thumb was grabbed
+static BOOL g_sbDragging, g_sbHover, g_mouseTracked;
 
 static Hist g_hist[256];
 static int g_nhist;
@@ -250,8 +266,8 @@ static int Fuzzy(const WCHAR *s, const WCHAR *q0) {
     int len = (int)wcslen(s);
     const WCHAR *sub = StrStrIW(s, q0);
     if (sub) {
-        int at = (int)(sub - s);
-        return 60 + (at == 0 ? 40 : IsWordStart(s, at) ? 20 : 0) - at / 2 - len / 10;
+        int at = (int)(sub - s), exact = at == 0 && (int)wcslen(q0) == len ? 60 : 0;
+        return 60 + exact + (at == 0 ? 40 : IsWordStart(s, at) ? 20 : 0) - at / 2 - len / 10;
     }
     int score = 0, si = 0, last = -1;
     BOOL acronym = TRUE;
@@ -382,7 +398,25 @@ static void FormatNum(double v, WCHAR *out, int cap) {
 
 // ---------------------------------------------------------------- files on disk: settings + history
 
+// Files and folders: shallow paths and paths in the user's own folder are usually the ones meant.
+static WCHAR g_profile[MAX_PATH];
+static int g_profileLen;
+
+static int PathBonus(const WCHAR *full) {
+    int depth = 0;
+    for (const WCHAR *p = full; *p; p++) depth += *p == L'\\';
+    int b = -3 * depth;
+    if (g_profileLen && !_wcsnicmp(full, g_profile, g_profileLen) && full[g_profileLen] == L'\\') b += 8;
+    return b;
+}
+
 static void InitPaths(void) {
+    PWSTR profile;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &profile))) {
+        lstrcpynW(g_profile, profile, MAX_PATH);
+        g_profileLen = (int)wcslen(g_profile);
+        CoTaskMemFree(profile);
+    }
     PWSTR roaming;
     if (FAILED(SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, NULL, &roaming))) return;
     _snwprintf(g_dataDir, MAX_PATH, L"%ls\\Expere", roaming);
@@ -489,11 +523,86 @@ static void ClearHistory(void) {
 
 // ---------------------------------------------------------------- app index (background thread)
 
-static WCHAR *HeapDup(HANDLE heap, const WCHAR *s) {
-    size_t n = (wcslen(s) + 1) * sizeof(WCHAR);
-    WCHAR *d = HeapAlloc(heap, 0, n);
-    if (d) memcpy(d, s, n);
+static WCHAR *IxDup(AppIndex *ix, const WCHAR *s) {
+    size_t n = wcslen(s) + 1;
+    if (n > ix->arenaLeft) {
+        size_t chunk = n > 8192 ? n : 8192;
+        ix->arena = HeapAlloc(ix->heap, 0, chunk * sizeof(WCHAR));
+        ix->arenaLeft = ix->arena ? chunk : 0;
+        if (!ix->arena) return NULL;
+    }
+    WCHAR *d = ix->arena;
+    memcpy(d, s, n * sizeof(WCHAR));
+    ix->arena += n;
+    ix->arenaLeft -= n;
     return d;
+}
+
+// Folders Windows Search does not index. Users is skipped because the index already covers it.
+#define DIR_DEPTH 5
+#define DIR_MAX   20000
+static const WCHAR *DIR_SKIP_ROOT[] = {L"Users", L"Windows", L"Program Files", L"Program Files (x86)", L"ProgramData",
+                                       L"PerfLogs", L"Recovery", L"System Volume Information", L"OneDriveTemp"};
+
+static int AddDir(AppIndex *ix, const WCHAR *name, int parent) {
+    if (ix->nd == ix->capd) {
+        int cap = ix->capd ? ix->capd * 2 : 512;
+        Dir *grown = ix->dirs ? HeapReAlloc(ix->heap, 0, ix->dirs, cap * sizeof(Dir)) : HeapAlloc(ix->heap, 0, cap * sizeof(Dir));
+        if (!grown) return -1;
+        ix->dirs = grown;
+        ix->capd = cap;
+    }
+    if (!(ix->dirs[ix->nd].name = IxDup(ix, name))) return -1;
+    ix->dirs[ix->nd].parent = parent;
+    return ix->nd++;
+}
+
+// path holds `len` characters on entry and is restored before returning.
+static void ScanDirs(AppIndex *ix, WCHAR *path, size_t len, int parent, int depth) {
+    if (depth > DIR_DEPTH || ix->nd >= DIR_MAX || len + 3 >= 1024) return;
+    wcscpy(path + len, L"\\*");
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(path, FindExInfoBasic, &fd, FindExSearchLimitToDirectories, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    path[len] = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const WCHAR *n = fd.cFileName;
+        DWORD skipAttr = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & skipAttr)) continue;
+        if (n[0] == L'.' || n[0] == L'$' || !_wcsicmp(n, L"node_modules")) continue;  // also "." and ".."
+        BOOL skip = FALSE;
+        for (int i = 0; depth == 1 && i < (int)ARRAYSIZE(DIR_SKIP_ROOT) && !skip; i++) skip = !_wcsicmp(n, DIR_SKIP_ROOT[i]);
+        size_t nl = wcslen(n);
+        if (skip || len + 1 + nl + 3 >= 1024) continue;
+        int me = AddDir(ix, n, parent);
+        if (me < 0) break;
+        path[len] = L'\\';
+        wcscpy(path + len + 1, n);
+        ScanDirs(ix, path, len + 1 + nl, me, depth + 1);
+        path[len] = 0;
+    } while (ix->nd < DIR_MAX && FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void ScanFixedDrives(AppIndex *ix) {
+    DWORD drives = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        WCHAR root[4] = {(WCHAR)(L'A' + i), L':', L'\\', 0}, path[1024] = {(WCHAR)(L'A' + i), L':', 0};
+        if (!(drives & (1u << i)) || GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        int me = AddDir(ix, path, -1);  // drive roots ("C:") are not search results
+        if (me < 0) return;
+        ScanDirs(ix, path, 2, me, 1);
+    }
+}
+
+// Rebuilds "C:\Expere\src" from the folder tree.
+static void DirPath(const AppIndex *ix, int i, WCHAR *out, int cap) {
+    int chain[DIR_DEPTH + 2], n = 0;
+    for (; i >= 0 && n < DIR_DEPTH + 2; i = ix->dirs[i].parent) chain[n++] = i;
+    int o = 0;
+    out[0] = 0;
+    while (n-- > 0 && o < cap - 1) o += _snwprintf(out + o, cap - o, o ? L"\\%ls" : L"%ls", ix->dirs[chain[n]].name);
+    out[cap - 1] = 0;
 }
 
 static DWORD WINAPI AppIndexThread(LPVOID unused) {
@@ -519,8 +628,8 @@ static DWORD WINAPI AppIndexThread(LPVOID unused) {
                             if (grown) { ix->items = grown; ix->cap = cap; }
                         }
                         if (ix->n < ix->cap) {
-                            ix->items[ix->n].name = HeapDup(heap, name);
-                            ix->items[ix->n].parse = HeapDup(heap, parse);
+                            ix->items[ix->n].name = IxDup(ix, name);
+                            ix->items[ix->n].parse = IxDup(ix, parse);
                             if (ix->items[ix->n].name && ix->items[ix->n].parse) ix->n++;
                         }
                     }
@@ -532,6 +641,7 @@ static DWORD WINAPI AppIndexThread(LPVOID unused) {
             }
             IShellItem_Release(folder);
         }
+        ScanFixedDrives(ix);
     }
     if (!ix || !PostMessageW(g_hwnd, WM_APP_APPS, 0, (LPARAM)ix)) {
         if (heap) HeapDestroy(heap);
@@ -552,6 +662,7 @@ static void StartAppIndex(void) {
 // Keeps `a` sorted by score, capped at `cap`. Returns the slot to fill, or NULL if it does not rank.
 static Result *Slot(Result *a, int *n, int cap, int score) {
     int i = *n;
+    if (!a) return NULL;  // window hidden: result lists are not allocated
     if (i == cap) {
         if (score <= a[cap - 1].score) return NULL;
         i = cap - 1;
@@ -767,21 +878,73 @@ static BOOL QueryEverything(const WCHAR *q) {
 
 // ---------------------------------------------------------------- query -> results
 
+// ---------------------------------------------------------------- scrolling
+
+static int VisRows(void) { return Min(g_nshown, g_set.maxResults); }
+
+static void ClampTop(void) { g_top = Max(0, Min(g_top, g_nshown - VisRows())); }
+
+static void EnsureSelVisible(void) {
+    if (g_sel < g_top) g_top = g_sel;
+    else if (g_sel >= g_top + VisRows()) g_top = g_sel - VisRows() + 1;
+    ClampTop();
+}
+
+static void ScrollBy(int rows) {
+    int old = g_top;
+    g_top += rows;
+    ClampTop();
+    if (g_top != old) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// Scroll bar geometry, in client coordinates: the track spans the visible rows.
+static void ScrollTrack(int *top, int *bottom) {
+    *top = S(EDIT_H) + S(1) + S(PAD);
+    *bottom = *top + VisRows() * S(ROW_H);
+}
+
+static void ScrollThumb(int *top, int *bottom) {
+    int tt, tb;
+    ScrollTrack(&tt, &tb);
+    int len = tb - tt, th = Max(S(28), len * VisRows() / Max(1, g_nshown)), range = g_nshown - VisRows();
+    *top = tt + (range > 0 ? (len - th) * g_top / range : 0);
+    *bottom = *top + th;
+}
+
+static BOOL InScrollbar(int x, int y) {
+    if (g_nshown <= VisRows()) return FALSE;
+    int tt, tb;
+    ScrollTrack(&tt, &tb);
+    return x >= S(WIN_W) - S(PAD) - S(4) && y >= tt && y < tb;
+}
+
+static void DragThumbTo(int y) {
+    int tt, tb, th0, th1;
+    ScrollTrack(&tt, &tb);
+    ScrollThumb(&th0, &th1);
+    int free = (tb - tt) - (th1 - th0), range = g_nshown - VisRows();
+    int top = free > 0 ? ((y - g_sbGrab - tt) * range + free / 2) / free : 0;
+    ScrollBy(top - g_top);
+}
+
+// ---------------------------------------------------------------- query -> results
+
 static void Merge(void) {
-    int a = 0, b = 0, n = 0, cap = g_query[0] ? g_set.maxResults - 1 : 0;
+    int a = 0, b = 0, n = 0, cap = g_query[0] ? MAX_SHOWN - 1 : 0;
     while (n < cap && (a < g_nlocal || b < g_nfiles)) {
         if (b >= g_nfiles || (a < g_nlocal && g_local[a].score >= g_files[b].score)) g_shown[n++] = &g_local[a++];
         else g_shown[n++] = &g_files[b++];
     }
-    if (g_query[0]) g_shown[n++] = &g_extra;
+    if (g_query[0]) g_shown[n++] = &g_extra;  // the web search is always the last row
     g_nshown = n;
     if (g_sel >= n) g_sel = n - 1;
     if (g_sel < 0) g_sel = 0;
+    ClampTop();
 }
 
 static void Relayout(void) {
     int w = S(WIN_W), h = S(EDIT_H);
-    if (g_nshown) h += S(1) + S(PAD) * 2 + g_nshown * S(ROW_H) + S(FOOT_H);
+    if (g_nshown) h += S(1) + S(PAD) * 2 + VisRows() * S(ROW_H) + S(FOOT_H);
     int x = g_work.left + ((g_work.right - g_work.left) - w) / 2;
     int y = g_work.top + (g_work.bottom - g_work.top) / 5;
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
@@ -796,15 +959,15 @@ static void OnQueryChanged(void) {
 
     g_seq++;
     g_nlocal = g_nfiles = 0;
-    g_sel = 0;
+    g_sel = g_top = 0;
     g_fileSource = FS_NONE;
     KillTimer(g_hwnd, TIMER_SEARCH);
 
     if (g_query[0]) {
         double v;
         BOOL calc = TryCalc(g_query, &v);
-        if (calc) {
-            Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, 1 << 20);
+        Result *r;
+        if (calc && (r = Slot(g_local, &g_nlocal, MAX_CAND, 1 << 20))) {
             r->kind = K_CALC;
             FormatNum(v, r->target, 64);
             _snwprintf(r->title, 160, L"= %ls", r->target);
@@ -816,7 +979,7 @@ static void OnQueryChanged(void) {
                 int s = Fuzzy(a->name, g_query);
                 if (s < 0) continue;
                 s += 30 + HistBonus(HistCount(L"shell:AppsFolder\\", a->parse));  // apps edge out files of equal quality
-                Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, s);
+                Result *r = Slot(g_local, &g_nlocal, MAX_CAND, s);
                 if (!r) continue;
                 r->kind = K_APP;
                 lstrcpynW(r->title, a->name, 160);
@@ -827,7 +990,7 @@ static void OnQueryChanged(void) {
         for (int i = 0; i < (int)ARRAYSIZE(CMDS); i++) {
             int s = Fuzzy(CMDS[i].name, g_query);
             if (s < 0) continue;
-            Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, s + 30);
+            Result *r = Slot(g_local, &g_nlocal, MAX_CAND, s + 30);
             if (!r) continue;
             r->kind = K_CMD;
             r->cmd = i;
@@ -835,6 +998,20 @@ static void OnQueryChanged(void) {
             wcscpy(r->sub, CMDS[i].sub);
         }
         if (g_set.files && !calc && wcslen(g_query) >= 2) {
+            for (int i = 0; g_apps && i < g_apps->nd; i++) {
+                const Dir *d = &g_apps->dirs[i];
+                int s = d->parent < 0 ? -1 : Fuzzy(d->name, g_query);
+                if (s < 0) continue;
+                WCHAR full[1100];
+                DirPath(g_apps, i, full, 1100);
+                Result *r = Slot(g_local, &g_nlocal, MAX_CAND, s - 10 + PathBonus(full) + HistBonus(HistCount(L"", full)));
+                if (!r) continue;
+                r->kind = K_FOLDER;
+                lstrcpynW(r->title, d->name, 160);
+                lstrcpynW(r->target, full, 1100);
+                DirPath(g_apps, d->parent, r->sub, 400);
+                if (r->sub[0] && !r->sub[2]) wcscat(r->sub, L"\\");  // "C:" -> "C:\"
+            }
             if (QueryEverything(g_query)) {
                 g_fileSource = FS_EVERYTHING;
             } else {
@@ -857,10 +1034,12 @@ static void OnQueryChanged(void) {
 }
 
 static void AddFile(const WCHAR *name, const WCHAR *dir, const WCHAR *full, BOOL folder) {
+    for (int i = 0; i < g_nlocal; i++)  // already listed from our own folder scan
+        if (!_wcsicmp(g_local[i].target, full)) return;
     int s = Fuzzy(name, g_query);
     if (s < 0) s = 0;
-    s += HistBonus(HistCount(L"", full)) - 10;
-    Result *r = Slot(g_files, &g_nfiles, MAX_ROWS, s);
+    s += HistBonus(HistCount(L"", full)) + PathBonus(full) - 10;
+    Result *r = Slot(g_files, &g_nfiles, MAX_CAND, s);
     if (!r) return;
     r->kind = folder ? K_FOLDER : K_FILE;
     lstrcpynW(r->title, name, 160);
@@ -870,7 +1049,7 @@ static void AddFile(const WCHAR *name, const WCHAR *dir, const WCHAR *full, BOOL
 
 // Used only when no file index answers: hand the query to Explorer.
 static void AddExplorerSearch(void) {
-    Result *r = Slot(g_local, &g_nlocal, MAX_ROWS, -200);
+    Result *r = Slot(g_local, &g_nlocal, MAX_CAND, -200);
     if (!r) return;
     WCHAR enc[1000];
     r->kind = K_SEARCH;
@@ -959,6 +1138,8 @@ static void FreeBuffers(void) {
     DibFree(&g_mask);
     DibFree(&g_icoK);
     DibFree(&g_icoW);
+    if (g_iconScratch) HeapFree(GetProcessHeap(), 0, g_iconScratch);
+    g_iconScratch = NULL;
 }
 
 static DWORD Premul(COLORREF c, int a) {
@@ -998,53 +1179,119 @@ static void FillRound(int l, int t, int r, int b, int rad, COLORREF c, int alpha
     }
 }
 
-// GDI writes no alpha, so text is drawn white-on-black into a mask and its coverage blended in.
+// Averaged subpixel coverage blended in sRGB makes strokes look thin; lift the edges like
+// DirectWrite's contrast enhancement does. Filled in by InitCoverageBoost.
+static BYTE g_coverageBoost[256];
+
+static void InitCoverageBoost(void) {
+    for (int i = 0; i < 256; i++) g_coverageBoost[i] = (BYTE)(255.0 * pow(i / 255.0, 0.75) + 0.5);
+}
+
+// GDI writes no alpha, so text is rendered with ClearType into a mask (light text white-on-black,
+// dark text black-on-white, so GDI applies the right gamma) and blended in from its coverage.
+// Over opaque pixels each colour channel gets its own coverage: real ClearType. Over see-through
+// pixels DWM only knows one alpha per pixel, so the three subpixel coverages are averaged.
 static void PaintText(const WCHAR *s, int n, RECT r, HFONT f, UINT fmt, COLORREF c, const RECT *clip) {
     RECT a = r, band = {0, g_bandY, g_band.w, g_bandY + g_bandH};
     if (clip && !IntersectRect(&a, &a, clip)) return;
     if (!IntersectRect(&a, &a, &band)) return;
-    for (int y = a.top; y < a.bottom; y++)
-        memset(g_mask.px + (y - g_bandY) * g_mask.w + a.left, 0, (a.right - a.left) * sizeof(DWORD));
+    int cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
+    BOOL light = cr * 299 + cg * 587 + cb * 114 >= 128000;
+    DWORD blank = light ? 0 : 0x00FFFFFF, flip = light ? 0 : 255;
+    for (int y = a.top; y < a.bottom; y++) {
+        DWORD *m = g_mask.px + (y - g_bandY) * g_mask.w;
+        for (int x = a.left; x < a.right; x++) m[x] = blank;
+    }
     SetViewportOrgEx(g_mask.dc, 0, -g_bandY, NULL);
     HGDIOBJ of = SelectObject(g_mask.dc, f);
-    SetTextColor(g_mask.dc, RGB(255, 255, 255));
+    SetTextColor(g_mask.dc, light ? RGB(255, 255, 255) : RGB(0, 0, 0));
     DrawTextW(g_mask.dc, s, n, &r, fmt | DT_NOPREFIX);
     SelectObject(g_mask.dc, of);
     GdiFlush();
-    int cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
     for (int y = a.top; y < a.bottom; y++) {
         DWORD *m = g_mask.px + (y - g_bandY) * g_mask.w, *d = g_band.px + (y - g_bandY) * g_band.w;
         for (int x = a.left; x < a.right; x++) {
             DWORD v = m[x];
-            int cov = Max(Max((v >> 16) & 255, (v >> 8) & 255), v & 255);
-            if (cov) Over(&d[x], ((DWORD)cov << 24) | ((DWORD)(cr * cov / 255) << 16) | ((DWORD)(cg * cov / 255) << 8) | (DWORD)(cb * cov / 255));
+            int kr = ((v >> 16) & 255) ^ flip, kg = ((v >> 8) & 255) ^ flip, kb = (v & 255) ^ flip;
+            if (!(kr | kg | kb)) continue;
+            DWORD p = d[x];
+            if ((p >> 24) == 255) {
+                int pr = (p >> 16) & 255, pg = (p >> 8) & 255, pb = p & 255;
+                d[x] = 0xFF000000 | ((DWORD)((cr * kr + pr * (255 - kr)) / 255) << 16) |
+                       ((DWORD)((cg * kg + pg * (255 - kg)) / 255) << 8) | (DWORD)((cb * kb + pb * (255 - kb)) / 255);
+            } else {
+                int cov = g_coverageBoost[(Max(Max(kr, kg), kb) + (kr + kg + kb) / 3) / 2];
+                Over(&d[x], ((DWORD)cov << 24) | ((DWORD)(cr * cov / 255) << 16) | ((DWORD)(cg * cov / 255) << 8) | (DWORD)(cb * cov / 255));
+            }
+        }
+    }
+}
+
+// Premultiplied image scaling: area average when shrinking, bilinear when enlarging.
+static void Resample(const DWORD *src, int n, DWORD *dst, int m) {
+    if (n == m) { memcpy(dst, src, n * n * sizeof(DWORD)); return; }
+    float sc = (float)n / m;
+    for (int dy = 0; dy < m; dy++) {
+        for (int dx = 0; dx < m; dx++) {
+            float acc[4] = {0}, wsum = 0;
+            if (m < n) {
+                float y0 = dy * sc, y1 = y0 + sc, x0 = dx * sc, x1 = x0 + sc;
+                for (int sy = (int)y0; sy < n && sy < y1; sy++) {
+                    float wy = fminf(y1, sy + 1.f) - fmaxf(y0, (float)sy);
+                    for (int sx = (int)x0; sx < n && sx < x1; sx++) {
+                        float w = wy * (fminf(x1, sx + 1.f) - fmaxf(x0, (float)sx));
+                        if (w <= 0) continue;
+                        DWORD p = src[sy * n + sx];
+                        acc[0] += w * (p >> 24); acc[1] += w * ((p >> 16) & 255); acc[2] += w * ((p >> 8) & 255); acc[3] += w * (p & 255);
+                        wsum += w;
+                    }
+                }
+            } else {
+                float fy = fmaxf((dy + 0.5f) * sc - 0.5f, 0), fx = fmaxf((dx + 0.5f) * sc - 0.5f, 0);
+                int y0 = (int)fy, x0 = (int)fx, y1 = Min(y0 + 1, n - 1), x1 = Min(x0 + 1, n - 1);
+                float ty = fy - y0, tx = fx - x0;
+                DWORD q[4] = {src[y0 * n + x0], src[y0 * n + x1], src[y1 * n + x0], src[y1 * n + x1]};
+                float w[4] = {(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty};
+                for (int k = 0; k < 4; k++) {
+                    acc[0] += w[k] * (q[k] >> 24); acc[1] += w[k] * ((q[k] >> 16) & 255);
+                    acc[2] += w[k] * ((q[k] >> 8) & 255); acc[3] += w[k] * (q[k] & 255);
+                }
+                wsum = 1;
+            }
+            DWORD out = 0;
+            for (int k = 0; k < 4; k++) out = (out << 8) | (DWORD)Min(255, (int)(acc[k] / wsum + 0.5f));
+            dst[dy * m + dx] = out;
         }
     }
 }
 
 // Alpha recovered from drawing the icon over black and over white: works for every icon format.
+// The icon is drawn at its native size and resampled, never stretched by GDI.
 static void DrawIconAlpha(HICON hic, int x, int y, int sz) {
-    if (y + sz <= g_bandY || y >= g_bandY + g_bandH) return;
-    if (!DibEnsure(&g_icoK, sz, sz) || !DibEnsure(&g_icoW, sz, sz)) return;
-    memset(g_icoK.px, 0, sz * sz * sizeof(DWORD));
-    for (int i = 0; i < sz * sz; i++) g_icoW.px[i] = 0x00FFFFFF;
-    DrawIconEx(g_icoK.dc, 0, 0, hic, sz, sz, 0, NULL, DI_NORMAL);
-    DrawIconEx(g_icoW.dc, 0, 0, hic, sz, sz, 0, NULL, DI_NORMAL);
+    int n = g_imlSize;
+    if (y + sz <= g_bandY || y >= g_bandY + g_bandH || n <= 0 || n > 64 || sz > 128) return;
+    if (!g_iconScratch) g_iconScratch = HeapAlloc(GetProcessHeap(), 0, (64 * 64 + 128 * 128) * sizeof(DWORD));
+    if (!g_iconScratch || !DibEnsure(&g_icoK, n, n) || !DibEnsure(&g_icoW, n, n)) return;
+    DWORD *native = g_iconScratch, *scaled = g_iconScratch + 64 * 64;
+    memset(g_icoK.px, 0, n * n * sizeof(DWORD));
+    for (int i = 0; i < n * n; i++) g_icoW.px[i] = 0x00FFFFFF;
+    DrawIconEx(g_icoK.dc, 0, 0, hic, n, n, 0, NULL, DI_NORMAL);
+    DrawIconEx(g_icoW.dc, 0, 0, hic, n, n, 0, NULL, DI_NORMAL);
     GdiFlush();
+    for (int i = 0; i < n * n; i++) {
+        DWORD k = g_icoK.px[i], w = g_icoW.px[i];
+        int kr = (k >> 16) & 255, kg = (k >> 8) & 255, kb = k & 255;
+        int diff = ((int)((w >> 16) & 255) - kr + (int)((w >> 8) & 255) - kg + (int)(w & 255) - kb) / 3;
+        int a = Max(0, Min(255, 255 - diff));
+        native[i] = ((DWORD)a << 24) | ((DWORD)Min(kr, a) << 16) | ((DWORD)Min(kg, a) << 8) | (DWORD)Min(kb, a);
+    }
+    Resample(native, n, scaled, sz);
     for (int yy = 0; yy < sz; yy++) {
         int by = y + yy - g_bandY;
         if (by < 0 || by >= g_bandH) continue;
         for (int xx = 0; xx < sz; xx++) {
             int bx = x + xx;
-            if (bx < 0 || bx >= g_band.w) continue;
-            DWORD k = g_icoK.px[yy * sz + xx], w = g_icoW.px[yy * sz + xx];
-            int kr = (k >> 16) & 255, kg = (k >> 8) & 255, kb = k & 255;
-            int diff = ((int)((w >> 16) & 255) - kr + (int)((w >> 8) & 255) - kg + (int)(w & 255) - kb) / 3;
-            int a = 255 - diff;
-            if (a <= 0) continue;
-            if (a > 255) a = 255;
-            Over(&g_band.px[by * g_band.w + bx],
-                 ((DWORD)a << 24) | ((DWORD)Min(kr, a) << 16) | ((DWORD)Min(kg, a) << 8) | (DWORD)Min(kb, a));
+            if (bx >= 0 && bx < g_band.w) Over(&g_band.px[by * g_band.w + bx], scaled[yy * sz + xx]);
         }
     }
 }
@@ -1175,33 +1422,46 @@ static BOOL SystemUsesDark(void) {
 }
 
 static DWORD BackgroundPixel(void) {
-    if (g_set.backdrop == BD_ACRYLIC && g_acrylic) return 0;  // DWM draws the blurred tint
-    return Premul(g_pal.tint, g_set.backdrop == BD_SOLID ? 255 : g_set.opacity * 255 / 100);
+    if (g_set.backdrop == BD_SOLID) return Premul(g_pal.tint, 255);
+    if (g_blur == BLUR_ACCENT) return 0;  // the accent's own tint carries the opacity
+    if (g_blur == BLUR_SYSTEM) return Premul(g_pal.tint, (g_set.opacity - 20) * 230 / 80);  // extra tint over the system's
+    return Premul(g_pal.tint, g_set.opacity * 255 / 100);  // clear glass
 }
 
-static void ApplyAppearance(void) {
-    BOOL dark = g_set.theme == THEME_DARK || (g_set.theme == THEME_SYSTEM && SystemUsesDark());
-    g_pal = dark ? PAL_DARK : PAL_LIGHT;
+// Acrylic uses the Windows 11 system backdrop (the Start menu's material), which blurs every kind
+// of window behind it, GPU-drawn browsers included. It needs a window frame, which WM_NCCALCSIZE
+// hides. Before Windows 11 22H2 it falls back to the undocumented accent policy, which reliably
+// blurs only classic GDI windows. Applied at startup, on settings changes, and on every show.
+static void ApplyBackdrop(void) {
+    BOOL dark = g_pal.dark, acrylic = g_set.backdrop == BD_ACRYLIC;
+    MARGINS mg = {-1, -1, -1, -1};  // DWM honours our alpha everywhere in the client area
+    DwmExtendFrameIntoClientArea(g_hwnd, &mg);
+    DWORD corner = 2;  // DWMWCP_ROUND
+    DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof dark);                  // DWMWA_USE_IMMERSIVE_DARK_MODE
+    DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof corner);              // DWMWA_WINDOW_CORNER_PREFERENCE
+    DwmSetWindowAttribute(g_hwnd, 34, &g_pal.border, sizeof g_pal.border);  // DWMWA_BORDER_COLOR
+
+    int type = acrylic ? 3 : 1;  // DWMSBT_TRANSIENTWINDOW : DWMSBT_NONE
+    BOOL system = SUCCEEDED(DwmSetWindowAttribute(g_hwnd, 38, &type, sizeof type)) && acrylic;  // DWMWA_SYSTEMBACKDROP_TYPE
 
     static SetWindowCompositionAttributeFn swca;
     if (!swca) swca = (SetWindowCompositionAttributeFn)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
-    AccentPolicy ap = {0};
-    if (g_set.backdrop == BD_ACRYLIC) {
+    AccentPolicy ap = {0};  // AccentState 0 clears it
+    if (acrylic && !system) {
         DWORD a = (DWORD)(g_set.opacity * 255 / 100);
         ap.AccentState = 4;  // ACCENT_ENABLE_ACRYLICBLURBEHIND
         ap.AccentFlags = 2;
         ap.GradientColor = (a << 24) | ((DWORD)GetBValue(g_pal.tint) << 16) | ((DWORD)GetGValue(g_pal.tint) << 8) | GetRValue(g_pal.tint);
     }
     WinCompAttrData data = {19 /* WCA_ACCENT_POLICY */, &ap, sizeof ap};
-    BOOL ok = swca && swca(g_hwnd, &data);
-    g_acrylic = ok && g_set.backdrop == BD_ACRYLIC;
+    BOOL accent = swca && swca(g_hwnd, &data) && ap.AccentState;
+    g_blur = system ? BLUR_SYSTEM : accent ? BLUR_ACCENT : BLUR_NONE;
+}
 
-    MARGINS mg = {-1, -1, -1, -1};  // DWM honours our alpha everywhere in the client area
-    DwmExtendFrameIntoClientArea(g_hwnd, &mg);
-    DWORD corner = 2;  // DWMWCP_ROUND
-    DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof dark);              // DWMWA_USE_IMMERSIVE_DARK_MODE
-    DwmSetWindowAttribute(g_hwnd, 33, &corner, sizeof corner);          // DWMWA_WINDOW_CORNER_PREFERENCE
-    DwmSetWindowAttribute(g_hwnd, 34, &g_pal.border, sizeof g_pal.border);  // DWMWA_BORDER_COLOR
+static void ApplyAppearance(void) {
+    BOOL dark = g_set.theme == THEME_DARK || (g_set.theme == THEME_SYSTEM && SystemUsesDark());
+    g_pal = dark ? PAL_DARK : PAL_LIGHT;
+    ApplyBackdrop();
     if (IsWindowVisible(g_hwnd)) { Merge(); Relayout(); }
 }
 
@@ -1308,9 +1568,18 @@ static void DrawScene(int w, int h) {
     if (!g_nshown) return;
     int line = Max(1, S(1)), top0 = S(EDIT_H) + S(1) + S(PAD);
     FillRound(0, S(EDIT_H), w, S(EDIT_H) + line, 0, g_pal.line, g_pal.lineA);
-    for (int i = 0; i < g_nshown; i++) {
+    for (int i = 0; i < VisRows(); i++) {
         int top = top0 + i * S(ROW_H);
-        if (top < g_bandY + g_bandH && top + S(ROW_H) > g_bandY) DrawRow(g_shown[i], i == g_sel, top, w);
+        if (top < g_bandY + g_bandH && top + S(ROW_H) > g_bandY) DrawRow(g_shown[g_top + i], g_top + i == g_sel, top, w);
+    }
+    if (g_nshown > VisRows()) {  // overlay scroll bar: a thin thumb that widens on hover, like Windows 11
+        int tt, tb, t0, t1;
+        BOOL wide = g_sbHover || g_sbDragging;
+        int bw = wide ? S(6) : Max(2, S(3)), right = w - S(3);
+        ScrollTrack(&tt, &tb);
+        ScrollThumb(&t0, &t1);
+        if (wide) FillRound(right - bw, tt, right, tb, bw / 2, g_pal.text, 20);
+        FillRound(right - bw, t0, right, t1, bw / 2, g_pal.text, wide ? 150 : 90);
     }
     int fy = h - S(FOOT_H);
     if (fy >= g_bandY + g_bandH || h <= g_bandY) return;
@@ -1332,7 +1601,7 @@ static void PaintWindow(HDC hdc, const RECT *dirty) {
     ys[nb++] = 0;
     if (g_nshown) {
         int top0 = S(EDIT_H) + S(1) + S(PAD);
-        for (int i = 0; i <= g_nshown; i++) ys[nb++] = Min(top0 + i * S(ROW_H), h);
+        for (int i = 0; i <= VisRows(); i++) ys[nb++] = Min(top0 + i * S(ROW_H), h);
     }
     if (ys[nb - 1] < h) ys[nb++] = h;
     int maxH = 0;
@@ -1350,17 +1619,18 @@ static void PaintWindow(HDC hdc, const RECT *dirty) {
     }
 }
 
+// Index into g_shown of the row under client y, or -1.
 static int RowAt(int y) {
     int top0 = S(EDIT_H) + S(1) + S(PAD);
     if (y < top0) return -1;
     int i = (y - top0) / S(ROW_H);
-    return i < g_nshown ? i : -1;
+    return i < VisRows() ? g_top + i : -1;
 }
 
 static HFONT MakeFont(int px, int weight, const WCHAR *face) {
     // Grayscale AA: ClearType needs an opaque background to blend against.
     return CreateFontW(-S(px), 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
 }
 
 static void CreateFonts(void) {
@@ -1381,7 +1651,13 @@ static void CreateFonts(void) {
     SelectObject(g_measureDC, g_fEdit);
     GetTextMetricsW(g_measureDC, &tm);
     g_editTextH = tm.tmHeight;
-    SHGetImageList(g_dpi > 120 ? SHIL_EXTRALARGE : SHIL_LARGE, &kIidImageList, (void **)&g_iml);
+    // Use the smallest system list at least as large as the drawn icon, then scale down:
+    // stretching the 32 px list up to 40 px (125% scaling) is what made icons soft.
+    BOOL large = S(32) > 32;
+    SHGetImageList(large ? SHIL_EXTRALARGE : SHIL_LARGE, &kIidImageList, (void **)&g_iml);
+    g_imlSize = large ? 48 : 32;
+    int cx, cy;
+    if (g_iml && ImageList_GetIconSize(g_iml, &cx, &cy)) g_imlSize = cx;
 }
 
 // ---------------------------------------------------------------- show / hide / actions
@@ -1395,6 +1671,10 @@ static void HideLauncher(void) {
     KillTimer(g_hwnd, TIMER_CARET);
     WsRequest(NULL, 0, TRUE);  // the worker drops its Windows Search connection
     FreeBuffers();
+    g_nlocal = g_nfiles = g_nshown = 0;  // ~200 KB of result lists, only needed while shown
+    HeapFree(GetProcessHeap(), 0, g_local);
+    HeapFree(GetProcessHeap(), 0, g_files);
+    g_local = g_files = NULL;
     Trim();
     SetTimer(g_hwnd, TIMER_TRIM, TRIM_AGAIN_MS, NULL);
 }
@@ -1423,9 +1703,12 @@ static void ShowLauncher(const WCHAR *text) {
     }
     g_scroll = 0;
     EnsureCaretVisible();
+    if (!g_local) g_local = HeapAlloc(GetProcessHeap(), 0, MAX_CAND * sizeof(Result));
+    if (!g_files) g_files = HeapAlloc(GetProcessHeap(), 0, MAX_CAND * sizeof(Result));
     OnQueryChanged();
 
     ShowWindow(g_hwnd, SW_SHOW);
+    ApplyBackdrop();
     if (!SetForegroundWindow(g_hwnd)) {
         // Opened from a process without foreground rights (tray, second instance): borrow the input queue.
         DWORD fg = GetWindowThreadProcessId(GetForegroundWindow(), NULL), me = GetCurrentThreadId();
@@ -1508,9 +1791,14 @@ static BOOL OnKey(WPARAM vk) {
     case VK_DOWN:
     case VK_UP:
     case VK_TAB:
+    case VK_PRIOR:
+    case VK_NEXT:
         if (!g_nshown) return TRUE;
-        if (vk == VK_UP || (vk == VK_TAB && shift)) g_sel = (g_sel + g_nshown - 1) % g_nshown;
+        if (vk == VK_PRIOR) g_sel = Max(0, g_sel - VisRows());
+        else if (vk == VK_NEXT) g_sel = Min(g_nshown - 1, g_sel + VisRows());
+        else if (vk == VK_UP || (vk == VK_TAB && shift)) g_sel = (g_sel + g_nshown - 1) % g_nshown;
         else g_sel = (g_sel + 1) % g_nshown;
+        EnsureSelVisible();
         InvalidateRect(g_hwnd, NULL, FALSE);
         return TRUE;
     case VK_RETURN:
@@ -1917,22 +2205,57 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (g_dragging) {
-            g_caret = HitChar(GET_X_LPARAM(lp));
+            g_caret = HitChar(x);
             CaretMoved();
             return 0;
         }
+        if (g_sbDragging) {
+            DragThumbTo(y);
+            return 0;
+        }
+        if (!g_mouseTracked) {  // ask for WM_MOUSELEAVE so the scroll bar can narrow again
+            TRACKMOUSEEVENT tme = {sizeof tme, TME_LEAVE, hwnd, 0};
+            g_mouseTracked = TrackMouseEvent(&tme);
+        }
+        BOOL hover = InScrollbar(x, y);
+        if (hover != g_sbHover) { g_sbHover = hover; InvalidateRect(hwnd, NULL, FALSE); }
         POINT pt;
         GetCursorPos(&pt);
-        if (pt.x == g_lastMouse.x && pt.y == g_lastMouse.y) return 0;
+        if (hover || (pt.x == g_lastMouse.x && pt.y == g_lastMouse.y)) return 0;
         g_lastMouse = pt;
-        int i = RowAt(GET_Y_LPARAM(lp));
+        int i = RowAt(y);
         if (i >= 0 && i != g_sel) { g_sel = i; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_mouseTracked = FALSE;
+        if (g_sbHover && !g_sbDragging) { g_sbHover = FALSE; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    case WM_MOUSEWHEEL: {
+        // One row per notch; touchpads send smaller deltas, which add up.
+        g_wheelAcc += GET_WHEEL_DELTA_WPARAM(wp);
+        int rows = g_wheelAcc / WHEEL_DELTA;
+        if (rows) { g_wheelAcc -= rows * WHEEL_DELTA; ScrollBy(-rows); }
         return 0;
     }
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         int y = GET_Y_LPARAM(lp);
+        if (InScrollbar(GET_X_LPARAM(lp), y)) {
+            int t0, t1;
+            ScrollThumb(&t0, &t1);
+            if (y >= t0 && y < t1) {  // grab the thumb
+                g_sbGrab = y - t0;
+                g_sbDragging = TRUE;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else {  // click on the track pages towards it
+                ScrollBy(y < t0 ? -VisRows() : VisRows());
+            }
+            return 0;
+        }
         if (y < S(EDIT_H)) {
             if (msg == WM_LBUTTONDBLCLK) {
                 g_anchor = 0;
@@ -1951,11 +2274,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP:
-        if (g_dragging) ReleaseCapture();
+        if (g_dragging || g_sbDragging) ReleaseCapture();
         return 0;
     case WM_CAPTURECHANGED:
-        g_dragging = FALSE;
+        if (g_sbDragging) InvalidateRect(hwnd, NULL, FALSE);
+        g_dragging = g_sbDragging = FALSE;
         return 0;
+    case WM_NCCALCSIZE:
+        if (wp) return 0;  // the client area covers the whole window: no visible frame
+        break;
+    case WM_NCHITTEST:
+        return HTCLIENT;  // no resize borders
+    case WM_SYSCOMMAND:
+        switch (wp & 0xFFF0) {
+        case SC_SIZE: case SC_MOVE: case SC_MINIMIZE: case SC_MAXIMIZE: case SC_RESTORE: return 0;
+        }
+        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
@@ -2040,8 +2374,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
     wc.hIconSm = g_icon;
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WND_CLASS, APP_NAME, WS_POPUP, 0, 0, 100, 100, NULL, NULL, inst, NULL);
+    // WS_THICKFRAME only so DWM gives the window a frame (needed for the system backdrop); it is
+    // hidden by WM_NCCALCSIZE and resizing is blocked in WM_NCHITTEST / WM_SYSCOMMAND.
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WND_CLASS, APP_NAME, WS_POPUP | WS_THICKFRAME,
+                             0, 0, 100, 100, NULL, NULL, inst, NULL);
+    SetWindowPos(g_hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     g_measureDC = CreateCompatibleDC(NULL);
+    InitCoverageBoost();
     g_dpi = GetDpiForWindow(g_hwnd);
     CreateFonts();
     ApplyAppearance();
