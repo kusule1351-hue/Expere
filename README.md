@@ -29,7 +29,7 @@ Open with `Ctrl+,`, the tray menu, or by typing `expere settings`. Saved to `%AP
 
 | Setting | Options |
 | --- | --- |
-| Shortcut | Alt / Ctrl / Ctrl+Alt / Ctrl+Shift / Alt+Shift / Win+Alt / Win+Shift + Space, `` ` ``, A–Z, 0–9, F1–F12. A shortcut another app already owns is refused with a message. |
+| Shortcut | Click the shortcut button, then press the keys you want (Esc cancels). It needs Ctrl, Alt or Win with the key, except F-keys, which work alone. Applied on Apply / OK; a shortcut another app already owns is refused with a message. |
 | Theme | Follow Windows, Dark, Light |
 | Background | **Acrylic** (blurred, like the Start menu), **Transparent** (clear tinted glass), **Solid** |
 | Opacity | 20–100 %: how strong the tint is over the blur or glass |
