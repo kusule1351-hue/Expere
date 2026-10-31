@@ -122,12 +122,6 @@ static const struct { const WCHAR *name, *url; } ENGINES[] = {
     {L"Brave Search", L"https://search.brave.com/search?q="},
 };
 
-static const struct { const WCHAR *name; UINT mod; } HOTMODS[] = {
-    {L"Alt", MOD_ALT}, {L"Ctrl", MOD_CONTROL}, {L"Ctrl + Alt", MOD_CONTROL | MOD_ALT},
-    {L"Ctrl + Shift", MOD_CONTROL | MOD_SHIFT}, {L"Alt + Shift", MOD_ALT | MOD_SHIFT},
-    {L"Win + Alt", MOD_WIN | MOD_ALT}, {L"Win + Shift", MOD_WIN | MOD_SHIFT},
-};
-
 typedef struct {
     UINT hotMod, hotKey;
     int theme, backdrop, opacity, maxResults, engine;
@@ -1862,10 +1856,13 @@ static BOOL OnKey(WPARAM vk) {
 
 static void KeyName(UINT vk, WCHAR *out, int cap) {
     if (vk == VK_SPACE) lstrcpynW(out, L"Space", cap);
-    else if (vk == VK_OEM_3) lstrcpynW(out, L"`", cap);
     else if (vk >= VK_F1 && vk <= VK_F24) _snwprintf(out, cap, L"F%u", vk - VK_F1 + 1);
     else if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) _snwprintf(out, cap, L"%c", (WCHAR)vk);
-    else _snwprintf(out, cap, L"Key %u", vk);
+    else {  // the keyboard layout's own name: "Enter", "Page Up", "Num 5", "`"...
+        UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        BOOL ext = (vk >= VK_PRIOR && vk <= VK_DOWN) || vk == VK_INSERT || vk == VK_DELETE || vk == VK_DIVIDE || vk == VK_NUMLOCK;
+        if (!sc || !GetKeyNameTextW((LONG)((sc << 16) | (ext ? 1u << 24 : 0)), out, cap)) _snwprintf(out, cap, L"Key %u", vk);
+    }
     out[cap - 1] = 0;
 }
 
@@ -1968,6 +1965,111 @@ static LPARAM ComboData(HWND d, int id) {
     return i < 0 ? 0 : SendDlgItemMessageW(d, id, CB_GETITEMDATA, i, 0);
 }
 
+// Shortcut recorder: a push button that, once clicked, captures the next key combination.
+// While it records, Expere's own hotkey is unregistered (so pressing the current shortcut reaches
+// the button) and IsDialogMessage is skipped (so Tab, Enter and Esc are keys, not navigation).
+#define HINT_IDLE L"Click, then press the new keys."
+static UINT g_dlgMod, g_dlgKey;    // the shortcut shown in the dialog; applied on Apply / OK
+static UINT g_prevMod, g_prevKey;  // what the button showed before this recording, for Esc
+static BOOL g_recording, g_recordCancel;
+static UINT g_recordPending;  // key that ended recording; we finish on its key-up so its character
+                              // (Alt+Space's space would open the system menu) is swallowed too
+
+static UINT HeldModifiers(void) {
+    UINT m = 0;
+    if (GetKeyState(VK_CONTROL) < 0) m |= MOD_CONTROL;
+    if (GetKeyState(VK_MENU) < 0) m |= MOD_ALT;
+    if (GetKeyState(VK_SHIFT) < 0) m |= MOD_SHIFT;
+    if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) m |= MOD_WIN;
+    return m;
+}
+
+static BOOL IsModifierKey(UINT vk) {
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN || (vk >= VK_LSHIFT && vk <= VK_RMENU);
+}
+
+static void RecorderShow(HWND d, const WCHAR *hint) {
+    WCHAR t[64];
+    UINT m = HeldModifiers();
+    if (!g_recording || g_recordPending) HotkeyName(g_dlgMod, g_dlgKey, t, 64);
+    else if (!m) lstrcpyW(t, L"Press the new shortcut…");
+    else {  // live preview of the modifiers held so far
+        _snwprintf(t, 64, L"%ls%ls%ls%ls…", m & MOD_WIN ? L"Win+" : L"", m & MOD_CONTROL ? L"Ctrl+" : L"",
+                   m & MOD_ALT ? L"Alt+" : L"", m & MOD_SHIFT ? L"Shift+" : L"");
+        t[63] = 0;
+    }
+    SetDlgItemTextW(d, IDC_HOTKEYBOX, t);
+    if (hint) SetDlgItemTextW(d, IDC_HOTKEYHINT, hint);
+}
+
+static void RecorderStart(HWND d) {
+    g_recording = TRUE;
+    g_recordPending = 0;
+    g_prevMod = g_dlgMod;
+    g_prevKey = g_dlgKey;
+    UnregisterHotKey(g_hwnd, HOTKEY_ID);
+    SetFocus(GetDlgItem(d, IDC_HOTKEYBOX));
+    RecorderShow(d, L"Press the keys now. Esc cancels.");
+}
+
+static void RecorderStop(HWND d, BOOL keep) {
+    if (!g_recording) return;
+    if (!keep) { g_dlgMod = g_prevMod; g_dlgKey = g_prevKey; }
+    g_recording = FALSE;
+    g_recordPending = 0;
+    g_hotkeyOk = SetHotkey(g_set.hotMod, g_set.hotKey);  // the saved shortcut works again until Apply / OK
+    BOOL changed = g_dlgMod != g_set.hotMod || g_dlgKey != g_set.hotKey;
+    RecorderShow(d, changed ? L"Press Apply or OK to use it." : HINT_IDLE);
+}
+
+static void RecorderKeyDown(HWND d, UINT vk, LPARAM lp) {
+    if (g_recordPending || (lp & (1 << 30))) return;  // already decided, or auto-repeat
+    if (IsModifierKey(vk)) { RecorderShow(d, NULL); return; }
+    UINT m = HeldModifiers();
+    if (vk == VK_ESCAPE && !m) {
+        g_recordPending = vk;
+        g_recordCancel = TRUE;
+        return;
+    }
+    // A plain key or Shift+key would take that key away from every app; F-keys are the exception.
+    if (!(m & (MOD_CONTROL | MOD_ALT | MOD_WIN)) && !(vk >= VK_F1 && vk <= VK_F24)) {
+        RecorderShow(d, L"Hold Ctrl, Alt or Win too (F-keys work alone).");
+        return;
+    }
+    g_dlgMod = m;
+    g_dlgKey = vk;
+    g_recordPending = vk;
+    g_recordCancel = FALSE;
+    RecorderShow(d, NULL);
+}
+
+static LRESULT CALLBACK RecorderProc(HWND b, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    HWND d = (HWND)ref;
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(b, RecorderProc, id);
+    if (g_recording) switch (msg) {
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        RecorderKeyDown(d, (UINT)wp, lp);
+        return 0;
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        if (g_recordPending && wp == g_recordPending) RecorderStop(d, !g_recordCancel);
+        else if (!g_recordPending) RecorderShow(d, NULL);
+        return 0;
+    case WM_CHAR:
+    case WM_SYSCHAR:
+    case WM_DEADCHAR:
+    case WM_SYSDEADCHAR:
+        return 0;  // no beeps, no system menu
+    case WM_KILLFOCUS:
+        RecorderStop(d, g_recordPending && !g_recordCancel);
+        break;
+    }
+    return DefSubclassProc(b, msg, wp, lp);
+}
+
 static void SettingsSync(HWND d) {
     int pos = (int)SendDlgItemMessageW(d, IDC_OPACITY, TBM_GETPOS, 0, 0);
     WCHAR t[8];
@@ -1981,27 +2083,11 @@ static void SettingsSync(HWND d) {
 
 static void SettingsInit(HWND d) {
     WCHAR name[32];
-    BOOL found = FALSE;
-    for (int i = 0; i < (int)ARRAYSIZE(HOTMODS); i++) {
-        BOOL sel = HOTMODS[i].mod == g_set.hotMod;
-        ComboAdd(d, IDC_HOTMOD, HOTMODS[i].name, HOTMODS[i].mod, sel);
-        found |= sel;
-    }
-    if (!found) ComboAdd(d, IDC_HOTMOD, L"Custom", g_set.hotMod, TRUE);  // hand-edited settings.ini
-    UINT keys[64];
-    int nk = 0;
-    keys[nk++] = VK_SPACE;
-    keys[nk++] = VK_OEM_3;
-    for (UINT k = 'A'; k <= 'Z'; k++) keys[nk++] = k;
-    for (UINT k = '0'; k <= '9'; k++) keys[nk++] = k;
-    for (UINT k = VK_F1; k <= VK_F12; k++) keys[nk++] = k;
-    found = FALSE;
-    for (int i = 0; i < nk; i++) {
-        KeyName(keys[i], name, 32);
-        ComboAdd(d, IDC_HOTKEY, name, keys[i], keys[i] == g_set.hotKey);
-        found |= keys[i] == g_set.hotKey;
-    }
-    if (!found) { KeyName(g_set.hotKey, name, 32); ComboAdd(d, IDC_HOTKEY, name, g_set.hotKey, TRUE); }
+    g_dlgMod = g_set.hotMod;
+    g_dlgKey = g_set.hotKey;
+    g_recording = FALSE;
+    SetWindowSubclass(GetDlgItem(d, IDC_HOTKEYBOX), RecorderProc, 1, (DWORD_PTR)d);
+    RecorderShow(d, HINT_IDLE);
 
     ComboAdd(d, IDC_THEME, L"Follow Windows", THEME_SYSTEM, g_set.theme == THEME_SYSTEM);
     ComboAdd(d, IDC_THEME, L"Dark", THEME_DARK, g_set.theme == THEME_DARK);
@@ -2028,8 +2114,8 @@ static void SettingsInit(HWND d) {
 
 static BOOL SettingsApply(HWND d) {
     Settings ns = g_set;
-    ns.hotMod = (UINT)ComboData(d, IDC_HOTMOD);
-    ns.hotKey = (UINT)ComboData(d, IDC_HOTKEY);
+    ns.hotMod = g_dlgMod;
+    ns.hotKey = g_dlgKey;
     ns.theme = (int)ComboData(d, IDC_THEME);
     ns.backdrop = (int)ComboData(d, IDC_BACKDROP);
     ns.opacity = (int)SendDlgItemMessageW(d, IDC_OPACITY, TBM_GETPOS, 0, 0);
@@ -2050,6 +2136,7 @@ static BOOL SettingsApply(HWND d) {
         }
         g_hotkeyOk = TRUE;
     }
+    SetDlgItemTextW(d, IDC_HOTKEYHINT, HINT_IDLE);
     BOOL startup = IsDlgButtonChecked(d, IDC_STARTUP) == BST_CHECKED;
     if (startup != StartupEnabled()) SetStartup(startup);
 
@@ -2082,6 +2169,10 @@ static INT_PTR CALLBACK SettingsProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BACKDROP:
             if (HIWORD(wp) == CBN_SELCHANGE) SettingsSync(d);
             return TRUE;
+        case IDC_HOTKEYBOX:  // click (or Space) starts recording; clicking again cancels
+            if (g_recording) RecorderStop(d, FALSE);
+            else RecorderStart(d);
+            return TRUE;
         case IDC_CLEARHIST:
             if (MessageBoxW(d, L"Forget which apps and files you open most? Ranking starts fresh.", L"Expere Settings",
                             MB_OKCANCEL | MB_ICONQUESTION) == IDOK)
@@ -2090,6 +2181,10 @@ static INT_PTR CALLBACK SettingsProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_DESTROY:
+        if (g_recording) {  // closed mid-recording: put the saved shortcut back
+            g_recording = FALSE;
+            g_hotkeyOk = SetHotkey(g_set.hotMod, g_set.hotKey);
+        }
         g_settingsDlg = NULL;
         SetTimer(g_hwnd, TIMER_TRIM, 1000, NULL);
         return TRUE;
@@ -2410,7 +2505,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdLine, int show) {
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        if (g_settingsDlg && IsDialogMessageW(g_settingsDlg, &msg)) continue;
+        if (g_settingsDlg && !g_recording && IsDialogMessageW(g_settingsDlg, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

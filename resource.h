@@ -1,7 +1,7 @@
 #define IDD_SETTINGS     100
 
-#define IDC_HOTMOD       1001
-#define IDC_HOTKEY       1002
+#define IDC_HOTKEYBOX    1001
+#define IDC_HOTKEYHINT   1002
 #define IDC_THEME        1003
 #define IDC_BACKDROP     1004
 #define IDC_OPACITY      1005
